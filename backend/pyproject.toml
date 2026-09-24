@@ -1,0 +1,62 @@
+[project]
+name = "vaultx-backend"
+version = "1.0.0"
+description = "VaultX backend — encrypted cloud storage with AES-256-GCM, searchable encryption, and tamper-evident audit logging"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "VaultX" }]
+dependencies = [
+    "asyncpg>=0.30.0",
+    "bcrypt<4.1",
+    "cryptography>=46.0.3",
+    "email-validator>=2.3.0",
+    "fastapi[standard]>=0.121.0",
+    "passlib[bcrypt]>=1.7.4",
+    "pydantic-settings>=2.11.0",
+    "pyjwt>=2.10.1",
+    "python-dotenv>=1.2.1",
+    "requests>=2.32.5",
+    "sqlalchemy[asyncio]>=2.0.44",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.12.0",
+    "mypy>=1.13.0",
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.28.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+indent-width = 4
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.hatch.build.targets.sdist]
+include = ["app", "backend/requirements.txt"]

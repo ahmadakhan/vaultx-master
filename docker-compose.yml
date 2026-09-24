@@ -1,0 +1,75 @@
+services:
+  db:
+    image: postgres:16
+    container_name: vaultx_db
+    restart: always
+    environment:
+      POSTGRES_USER: vaultx_user
+      POSTGRES_PASSWORD: vaultx_pass
+      POSTGRES_DB: vaultx
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - vaultx_net
+    ports:
+      - "5432"
+
+  backend:
+    build: ./backend
+    container_name: vaultx_backend
+    restart: always
+    environment:
+      APP_ENV: prod
+      APP_SECRET_KEY: ${APP_SECRET_KEY:?APP_SECRET_KEY must be set}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set}
+      JWT_ALGORITHM: HS256
+      JWT_EXPIRE_MINUTES: 60
+      JWT_REFRESH_EXPIRE_DAYS: 30
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: vaultx
+      DB_USER: vaultx_user
+      DB_PASSWORD: vaultx_pass
+      MAIL_HOST: smtp.gmail.com
+      MAIL_PORT: 587
+      MAIL_USERNAME: noreply
+      MAIL_PASSWORD: ${MAIL_PASSWORD:?MAIL_PASSWORD must be set}
+      MAIL_FROM: "VaultX <noreply@vaultx.in>"
+      MAIL_STARTTLS: "true"
+      MAIL_SSL_TLS: "false"
+      KEYS_DIR: /etc/vaultx/keys
+      FALLBACK_KEYS_DIR: .secret/keys
+      ALLOWED_ORIGINS: "http://localhost:3000,http://vaultx.local"
+      RATE_LIMIT_RATE: 100
+      RATE_LIMIT_CAPACITY: 200
+    depends_on:
+      - db
+    networks:
+      - vaultx_net
+    ports:
+      - "8000"
+    volumes:
+      - ./backend:/app
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://backend:8000
+    container_name: vaultx_frontend
+    restart: always
+    environment:
+      NEXT_PUBLIC_API_URL: http://backend:8000
+    depends_on:
+      - backend
+    networks:
+      - vaultx_net
+    ports:
+      - "${PORT:-3000}:3000"
+
+networks:
+  vaultx_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
