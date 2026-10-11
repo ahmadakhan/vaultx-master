@@ -76,11 +76,13 @@ def verify_password(password: str, hashed: str) -> bool:
     Returns:
         ``True`` if the password matches, ``False`` otherwise.
     """
+    if len(password.encode("utf-8")) > BCRYPT_MAX_PASSWORD_BYTES:
+        return False
     try:
         result: bool = pwd_context.verify(password, hashed)
         return result
-    except (ValueError, TypeError) as exc:
-        logger.warning("Password verification failed: %s", exc)
+    except (ValueError, TypeError):
+        logger.warning("Password verification failed")
         return False
 
 
@@ -126,10 +128,7 @@ def create_access_token(
         (or the provided ``expires_delta``).
     """
     delta = expires_delta or timedelta(minutes=settings.jwt_expire_minutes)
-    if jti is not None:
-        data = data.copy()
-        data["jti"] = jti
-    return _create_token(data, delta, ACCESS_TOKEN_TYPE)
+    return _create_token(data, delta, ACCESS_TOKEN_TYPE, jti=jti or uuid.uuid4().hex)
 
 
 def create_mfa_challenge_token(
@@ -151,10 +150,7 @@ def create_mfa_challenge_token(
         A signed JWT string valid only for ``POST /auth/mfa/verify``.
     """
     delta = expires_delta or timedelta(minutes=10)
-    if jti is not None:
-        data = data.copy()
-        data["jti"] = jti
-    return _create_token(data, delta, MFA_CHALLENGE_TOKEN_TYPE)
+    return _create_token(data, delta, MFA_CHALLENGE_TOKEN_TYPE, jti=jti or uuid.uuid4().hex)
 
 
 def create_refresh_token(data: dict[str, Any], *, jti: str | None = None) -> str:
@@ -191,7 +187,7 @@ def decode_token(
     token: str,
     *,
     expected_type: str | None = None,
-    required_claims: tuple[str, ...] = ("sub", "type"),
+    required_claims: tuple[str, ...] = ("sub", "type", "jti", "iat"),
 ) -> dict[str, Any]:
     """Decode and validate a JWT token.
 
@@ -228,5 +224,12 @@ def decode_token(
     missing = [claim for claim in required_claims if not payload.get(claim)]
     if missing:
         raise ValueError(f"Token missing required claims: {', '.join(missing)}")
+
+    for claim in ("sub", "type", "jti"):
+        if not isinstance(payload.get(claim), str) or not payload[claim]:
+            raise ValueError("Invalid token claims")
+    for claim in ("exp", "iat"):
+        if type(payload.get(claim)) not in (int, float):
+            raise ValueError("Invalid token timestamps")
 
     return payload

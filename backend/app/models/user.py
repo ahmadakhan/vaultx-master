@@ -61,8 +61,7 @@ class User(Base):
     index_state_iv: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
     # --- MFA (TOTP) ---
-    # The TOTP secret is encrypted with the user's password-derived key before
-    # being stored, so the server never sees the plaintext secret.
+    # TOTP is encrypted server-side with an application-secret-derived key.
     mfa_secret_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     mfa_secret_iv: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     mfa_secret_salt: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
@@ -108,6 +107,17 @@ class Role(Base):
 
     __tablename__ = "roles"
     name: Mapped[str] = mapped_column(String, primary_key=True)
+
+
+class AuthenticationAttempt(Base):
+    """Shared authentication attempt budget across workers."""
+
+    __tablename__ = "authentication_attempts"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
 
 class UserRole(Base):

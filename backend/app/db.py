@@ -18,7 +18,8 @@ _is_sqlite = _db_url.startswith("sqlite")
 
 engine = create_async_engine(
     _db_url,
-    echo=(settings.app_env == "dev"),
+    echo=False,
+    hide_parameters=True,
     **(
         {}
         if _is_sqlite

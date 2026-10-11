@@ -13,24 +13,24 @@ interface EmptyStateProps {
 
 export function EmptyState({
   title = "No files here",
-  description = "Upload a file to get started. VaultX encrypts everything before it leaves your device.",
+  description = "Upload your first file to keep your documents organized in one place.",
   actionLabel = "Upload Files",
   onAction,
   secondaryLabel,
   onSecondary,
 }: EmptyStateProps) {
   return (
-    <div className="flex flex-col items-center justify-center h-full px-6 text-center">
-      <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-muted/50 mb-6">
+    <div className="flex flex-col items-center justify-center min-h-72 h-full px-6 py-12 text-center">
+      <div aria-hidden="true" className="inline-flex items-center justify-center w-16 h-16 rounded-2xl border border-border bg-muted/50 mb-6">
         <EmptyVaultIcon className="w-8 h-8 text-muted-foreground" />
       </div>
       <h3 className="vaultx-subheading mb-2">{title}</h3>
       <p className="vaultx-secondary max-w-sm mb-6">{description}</p>
-      <div className="flex items-center gap-3">
-        {actionLabel && (
+      <div className="flex flex-wrap justify-center items-center gap-3">
+        {actionLabel && onAction && (
           <Button onClick={onAction}>{actionLabel}</Button>
         )}
-        {secondaryLabel && (
+        {secondaryLabel && onSecondary && (
           <Button variant="link" onClick={onSecondary}>
             {secondaryLabel}
           </Button>

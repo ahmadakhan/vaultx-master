@@ -135,7 +135,7 @@ async def record_audit_log(
             conflicts with concurrent writers.
     """
     client_ip = client_ip_from_scope(request.scope, settings.trusted_proxy_networks) or "unknown"
-    user_agent = request.headers.get("User-Agent", "unknown")
+    user_agent = request.headers.get("User-Agent", "unknown")[:512]
 
     for attempt in range(1, _MAX_CHAIN_ATTEMPTS + 1):
         if user_id is not None:
@@ -162,7 +162,7 @@ async def record_audit_log(
             "timestamp": datetime.now(UTC).isoformat(),
             "ip": client_ip,
             "user_agent": user_agent,
-            "path": request.url.path,
+            "path": getattr(request.scope.get("route"), "path", "<unmatched>"),
             "method": request.method,
         }
         if user_id is not None:

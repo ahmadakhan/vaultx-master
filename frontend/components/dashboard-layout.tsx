@@ -7,9 +7,7 @@ import {
   Search,
   X,
   SunMoon,
-  User,
   LogOut,
-  Settings,
   ChevronDown,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -23,14 +21,18 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
+import { clearVaultXContext, getSessionContext } from "@/lib/crypto/context";
+import { WorkspaceHub } from "@/components/workspace-context";
+import type { WorkspaceContextAdapter } from "@/lib/workspace-context";
 
 interface DashboardLayoutProps {
   children: React.ReactNode;
   onSearch?: (query: string) => void;
   onNavigate?: (section: string) => void;
+  workspaceContext?: WorkspaceContextAdapter;
 }
 
-export function DashboardLayout({ children, onSearch, onNavigate }: DashboardLayoutProps) {
+export function DashboardLayout({ children, onSearch, onNavigate, workspaceContext }: DashboardLayoutProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   const [email, setEmail] = useState("");
@@ -42,7 +44,7 @@ export function DashboardLayout({ children, onSearch, onNavigate }: DashboardLay
   }, []);
 
   useEffect(() => {
-    const storedEmail = sessionStorage.getItem("vaultx_user_email");
+    const storedEmail = getSessionContext()?.email;
     if (storedEmail) setEmail(storedEmail);
   }, []);
 
@@ -75,20 +77,21 @@ export function DashboardLayout({ children, onSearch, onNavigate }: DashboardLay
 
   if (!mounted) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-background text-muted-foreground">
+      <div role="status" className="min-h-screen flex items-center justify-center bg-background text-muted-foreground">
         Loading...
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen flex flex-col bg-background">
+    <div className="vaultx-shell min-h-screen flex flex-col bg-background">
+      <a href="#vaultx-content" className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-md focus:bg-card focus:px-4 focus:py-3 focus:shadow-md">Skip to content</a>
       {/* ——— Enhanced Header (Top Bar) ——— */}
-      <header className="border-b border-border bg-card shadow-sm">
-        <div className="flex h-16 items-center justify-between px-6 w-full max-w-[var(--container-max)] mx-auto">
+      <header className="border-b border-border bg-card">
+        <div className="flex min-h-18 flex-wrap items-center justify-between gap-3 px-4 py-3 sm:px-6 lg:px-8 w-full mx-auto">
           {/* Left Section: Logo + app name */}
           <div className="flex items-center space-x-3">
-            <div className="w-9 h-9 rounded-lg bg-primary flex items-center justify-center">
+            <div className="size-10 rounded-lg border-b-2 border-emerald bg-primary flex items-center justify-center">
               <VaultIcon className="w-5 h-5 text-primary-foreground" />
             </div>
             <span className="text-xl font-semibold text-foreground tracking-tight">
@@ -97,31 +100,28 @@ export function DashboardLayout({ children, onSearch, onNavigate }: DashboardLay
           </div>
 
           {/* Center Section: Global search */}
-          <div className="flex-1 max-w-2xl mx-8 flex items-center space-x-3">
-            <form onSubmit={handleSearchSubmit} className="relative flex-1">
+          <div className="order-3 w-full sm:order-none sm:w-auto sm:flex-1 sm:max-w-xl sm:mx-6 flex items-center">
+            <form role="search" onSubmit={handleSearchSubmit} className="relative flex-1">
               <Search
                 className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none"
                 strokeWidth={1.5}
               />
               <Input
                 ref={inputRef}
-                placeholder="Search Vault"
+                aria-label="Search files in your vault"
+                placeholder="Search files…"
                 value={searchQuery}
                 onChange={handleSearchChange}
                 className={cn(
-                  "pl-10 pr-10 h-10 bg-muted/50 border-border rounded-md",
+                  "pl-10 pr-12 h-11 bg-muted/50 border-input-border rounded-md",
                   "focus:bg-background focus:border-ring"
                 )}
               />
-              <kbd
-                className="absolute right-24 top-1/2 -translate-y-1/2 hidden sm:inline-flex items-center gap-1 px-1.5 py-0.5 text-xs text-muted-foreground bg-muted/60 border border-border rounded">
-                <span className="text-xs">⌘</span>K
-              </kbd>
               {searchQuery && (
                 <button
                   type="button"
                   onClick={clearSearch}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-muted cursor-pointer"
+                   className="absolute right-0 top-1/2 -translate-y-1/2 flex size-11 items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted cursor-pointer"
                   aria-label="Clear search"
                 >
                   <X className="w-3.5 h-3.5" strokeWidth={1.5} />
@@ -135,9 +135,9 @@ export function DashboardLayout({ children, onSearch, onNavigate }: DashboardLay
             <Button
               variant="ghost"
               size="icon"
-              className="h-9 w-9 text-muted-foreground hover:text-foreground hover:bg-accent/50"
+              className="size-11 text-muted-foreground hover:text-foreground hover:bg-accent/50"
               onClick={toggleTheme}
-              aria-label="Toggle theme"
+              aria-label={`Switch to ${resolvedTheme === "dark" ? "light" : "dark"} theme`}
             >
               <SunMoon className="w-5 h-5" strokeWidth={1.5} />
             </Button>
@@ -154,7 +154,7 @@ export function DashboardLayout({ children, onSearch, onNavigate }: DashboardLay
                       {avatarFallback}
                     </AvatarFallback>
                   </Avatar>
-                  <span className="hidden sm:block text-sm font-medium text-foreground">
+                  <span className="hidden lg:block max-w-36 truncate text-sm font-medium text-foreground">
                     {displayName}
                   </span>
                   <ChevronDown className="w-4 h-4 text-muted-foreground" strokeWidth={1.5} />
@@ -163,17 +163,8 @@ export function DashboardLayout({ children, onSearch, onNavigate }: DashboardLay
 
               <DropdownMenuContent align="end" className="w-56">
                 <div className="px-3 py-2 border-b border-border">
-                  <p className="text-sm font-medium text-foreground">{email || "user@example.com"}</p>
-                  <p className="text-xs text-muted-foreground">Enterprise plan</p>
+                  <p className="break-words text-sm font-medium text-foreground">{email || "Your account"}</p>
                 </div>
-
-                <DropdownMenuItem
-                  onSelect={() => {}}
-                  className="cursor-pointer focus:bg-accent/50"
-                >
-                  <User className="w-4 h-4 mr-2" strokeWidth={1.5} />
-                  Profile
-                </DropdownMenuItem>
 
                 <DropdownMenuItem
                   onSelect={() => setTheme(resolvedTheme === "dark" ? "light" : "dark")}
@@ -183,20 +174,11 @@ export function DashboardLayout({ children, onSearch, onNavigate }: DashboardLay
                   Toggle Theme
                 </DropdownMenuItem>
 
-                <DropdownMenuItem
-                  onSelect={() => {}}
-                  className="cursor-pointer focus:bg-accent/50"
-                >
-                  <Settings className="w-4 h-4 mr-2" strokeWidth={1.5} />
-                  Settings
-                </DropdownMenuItem>
-
                 <DropdownMenuSeparator />
 
                 <DropdownMenuItem
                   onSelect={() => {
-                    localStorage.clear();
-                    sessionStorage.clear();
+                    clearVaultXContext();
                     window.location.href = "/";
                   }}
                   className="text-destructive focus:text-destructive cursor-pointer focus:bg-destructive/10"
@@ -210,7 +192,9 @@ export function DashboardLayout({ children, onSearch, onNavigate }: DashboardLay
         </div>
       </header>
 
-      {children}
+      <WorkspaceHub adapter={workspaceContext} />
+
+      <div id="vaultx-content" tabIndex={-1} className="flex flex-1 flex-col min-w-0 outline-none">{children}</div>
     </div>
   );
 }

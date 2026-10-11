@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+backend/*.db
+backend/test_keys/
+backend/test_storage/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/

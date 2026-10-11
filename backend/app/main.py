@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import asyncio
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -50,7 +51,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             "Request completed",
             extra={
                 "method": request.method,
-                "path": request.url.path,
+                "path": getattr(request.scope.get("route"), "path", "<unmatched>"),
                 "status_code": response.status_code,
                 "duration_ms": round(elapsed_ms, 2),
             },
@@ -63,14 +64,25 @@ def _register_exception_handlers(app: FastAPI) -> None:
     handler = get_exception_handler()
     app.add_exception_handler(VaultXError, handler)
 
+    @app.exception_handler(RequestValidationError)
+    async def _validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        # Pydantic's input/context may include passwords, tokens, or exception
+        # objects that cannot be JSON encoded. Return only safe field metadata.
+        errors = [
+            {key: error[key] for key in ("type", "loc", "msg") if key in error}
+            for error in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": errors})
+
     @app.exception_handler(Exception)
     async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
         logger.error(
             "Unhandled exception",
             extra={
                 "method": request.method,
-                "path": request.url.path,
-                "error": str(exc),
+                "path": getattr(request.scope.get("route"), "path", "<unmatched>"),
                 "error_type": type(exc).__name__,
             },
         )
@@ -125,7 +137,7 @@ async def _trash_reaper_loop() -> None:
                                 _File.deleted.is_(True),
                                 _File.deleted_at.is_not(None),
                                 _File.deleted_at <= cutoff,
-                            )
+                            ).with_for_update(skip_locked=True).limit(100)
                         )
                     )
                     .scalars()
@@ -134,17 +146,22 @@ async def _trash_reaper_loop() -> None:
                 if not rows:
                     continue
                 storage = _get_storage()
-                purged = 0
+                blob_ids = []
                 for f in rows:
-                    try:
-                        if f.storage_path:
-                            storage.delete_blob(str(f.id))
-                        await session.delete(f)
-                        purged += 1
-                    except Exception:
-                        logger.exception("Failed to purge expired file", extra={"file_id": str(f.id)})
+                    if f.storage_path:
+                        blob_ids.append(str(f.id))
+                    await session.delete(f)
+                # A failed transaction must never destroy a restorable blob.
+                # Restores acquire the same row lock before changing state.
                 await session.commit()
-                logger.info("Trash reaper purged expired files", extra={"count": purged})
+                for file_id in blob_ids:
+                    try:
+                        storage.delete_blob(file_id)
+                    except Exception:
+                        logger.exception(
+                            "Failed to remove orphaned ciphertext", extra={"file_id": file_id}
+                        )
+                logger.info("Trash reaper purged expired files", extra={"count": len(rows)})
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -164,6 +181,7 @@ def _create_lifespan() -> Any:
         # Seed default roles if they don't exist
         from sqlalchemy import select as _select
         from sqlalchemy.ext.asyncio import async_sessionmaker
+
         async_session = async_sessionmaker(engine, expire_on_commit=False)
         async with async_session() as session:
             for role_name in ("admin", "user"):
@@ -186,10 +204,8 @@ def _create_lifespan() -> Any:
         yield
 
         reaper_task.cancel()
-        try:
+        with suppress(asyncio.CancelledError):
             await reaper_task
-        except asyncio.CancelledError:
-            pass
         await engine.dispose()
         logger.info("Database connection closed")
 
@@ -252,8 +268,8 @@ def create_app() -> FastAPI:
         try:
             async with AsyncSessionLocal() as session:
                 await session.execute(text("SELECT 1"))
-        except Exception as exc:
-            logger.error("Database health check failed", extra={"error": str(exc)})
+        except Exception:
+            logger.error("Database health check failed")
             db_status = "unreachable"
 
         return {

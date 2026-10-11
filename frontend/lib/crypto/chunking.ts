@@ -25,6 +25,9 @@ export function buildChunkIv(nonce: Uint8Array, chunkIndex: number): Uint8Array<
   if (nonce.byteLength !== NONCE_LENGTH) {
     throw new Error("Invalid file IV: expected 12 bytes");
   }
+  if (!Number.isSafeInteger(chunkIndex) || chunkIndex < 0 || chunkIndex > 0xffffffff) {
+    throw new Error("Invalid chunk index");
+  }
   const iv = new Uint8Array(nonce);
   new DataView(iv.buffer).setUint32(8, chunkIndex, false);
   return iv;
@@ -37,14 +40,24 @@ export function buildChunkIv(nonce: Uint8Array, chunkIndex: number): Uint8Array<
  * @param key        The imported AES-GCM file key (Kf).
  * @param fileIvB64  Base64 of the persisted file nonce (`file_iv`).
  * @param chunkSize  Plaintext chunk size used at upload time.
+ * @param expectedSize Plaintext size from authenticated metadata, when available.
  */
 export async function decryptChunkedGCM(
   ciphertext: ArrayBuffer,
   key: CryptoKey,
   fileIvB64: string,
   chunkSize: number = CHUNK_SIZE,
+  expectedSize?: number,
 ): Promise<ArrayBuffer> {
-  const nonce = new Uint8Array(b64ToBuf(fileIvB64));
+  if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0 || chunkSize > CHUNK_SIZE) {
+    throw new Error("Invalid chunk size");
+  }
+  let nonce: Uint8Array;
+  try {
+    nonce = new Uint8Array(b64ToBuf(fileIvB64));
+  } catch {
+    throw new Error("Invalid file IV");
+  }
   if (nonce.byteLength !== NONCE_LENGTH) {
     throw new Error("Invalid file IV");
   }
@@ -52,32 +65,45 @@ export async function decryptChunkedGCM(
   const total = ciphertext.byteLength;
   const segmentSize = chunkSize + GCM_TAG_LENGTH;
   const segmentCount = Math.ceil(total / segmentSize);
-  if (segmentCount === 0 || total <= GCM_TAG_LENGTH * segmentCount) {
+  const finalSegmentLength = total - (segmentCount - 1) * segmentSize;
+  // A single tag encodes an empty file. Later chunks must contain plaintext;
+  // every segment must have its own complete tag, and counters must not wrap.
+  if (segmentCount === 0 || segmentCount > 0x100000000 ||
+      finalSegmentLength < GCM_TAG_LENGTH ||
+      (segmentCount > 1 && finalSegmentLength === GCM_TAG_LENGTH)) {
     throw new Error("Empty or malformed ciphertext");
+  }
+  // The authenticated metadata carries the plaintext size. Check it to detect
+  // removal of complete trailing chunks, which individual tags cannot detect.
+  if (expectedSize !== undefined && (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || total - GCM_TAG_LENGTH * segmentCount !== expectedSize)) {
+    throw new Error("File size does not match authenticated metadata");
   }
 
   const plaintext = new Uint8Array(total - GCM_TAG_LENGTH * segmentCount);
   let inOffset = 0;
   let outOffset = 0;
 
-  for (let i = 0; i < segmentCount; i++) {
-    const segmentLength =
-      i === segmentCount - 1 ? total - (segmentCount - 1) * segmentSize : segmentSize;
-    const segment = ciphertext.slice(inOffset, inOffset + segmentLength);
-    const iv = buildChunkIv(nonce, i);
-    let part: ArrayBuffer;
-    try {
-      part = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, segment);
-    } catch (err) {
-      throw new Error(
-        `File decryption failed at chunk ${i} (wrong key or corrupted data): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
+  try {
+    for (let i = 0; i < segmentCount; i++) {
+      const segmentLength = i === segmentCount - 1 ? finalSegmentLength : segmentSize;
+      const segment = ciphertext.slice(inOffset, inOffset + segmentLength);
+      const iv = buildChunkIv(nonce, i);
+      const part = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, segment));
+      try {
+        if (part.byteLength !== segmentLength - GCM_TAG_LENGTH) {
+          throw new Error("Invalid decrypted chunk size");
+        }
+        plaintext.set(part, outOffset);
+        outOffset += part.byteLength;
+      } finally {
+        // Best-effort clearing of this owned buffer, not engine-internal copies.
+        part.fill(0);
+      }
+      inOffset += segmentLength;
     }
-    plaintext.set(new Uint8Array(part), outOffset);
-    outOffset += part.byteLength;
-    inOffset += segmentLength;
+  } catch {
+    plaintext.fill(0);
+    throw new Error("File decryption failed (wrong key or corrupted data)");
   }
 
   return plaintext.buffer;

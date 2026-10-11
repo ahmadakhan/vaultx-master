@@ -1,6 +1,8 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { clearVaultXContext } from "@/lib/crypto/context";
 import {
   Vault,
   UploadCloud,
@@ -10,8 +12,6 @@ import {
   ChevronLeft,
   ChevronRight,
   LogOut,
-  User,
-  Settings,
   LayoutDashboard,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -32,6 +32,7 @@ interface SidebarItem {
 }
 
 export function Sidebar({ activeSection, setActiveSection, onNavigate }: SidebarProps) {
+  const router = useRouter();
   const [uploadModalOpen, setUploadModalOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
 
@@ -60,8 +61,8 @@ export function Sidebar({ activeSection, setActiveSection, onNavigate }: Sidebar
   return (
     <aside
       className={cn(
-        "flex flex-col border-r border-border bg-card transition-all duration-200",
-        collapsed ? "w-14" : "w-64"
+        "vaultx-sidebar shrink-0 flex flex-col border-r border-border bg-card transition-[width] duration-200",
+        collapsed ? "w-20" : "w-60"
       )}
     >
       <div className="p-3 border-b border-border">
@@ -75,14 +76,15 @@ export function Sidebar({ activeSection, setActiveSection, onNavigate }: Sidebar
               : "bg-primary hover:bg-primary/90 text-primary-foreground"
           )}
           onClick={handleUpload}
-          aria-label={collapsed ? "Upload File" : undefined}
+          aria-label="Upload file"
+          title="Upload file"
         >
           <UploadCloud className={cn("shrink-0", collapsed ? "w-5 h-5" : "w-4 h-4 mr-2")} />
-          {!collapsed && <span>Upload File</span>}
+          {!collapsed && <span className="sidebar-label">Upload File</span>}
         </Button>
       </div>
 
-      <nav className="flex-1 px-2 py-3 space-y-1 overflow-y-auto">
+      <nav aria-label="Workspace" className="flex-1 px-3 py-5 space-y-1 overflow-y-auto">
         {adminItems.map((item) => {
           const button = (
             <Button
@@ -91,14 +93,15 @@ export function Sidebar({ activeSection, setActiveSection, onNavigate }: Sidebar
               size={collapsed ? "icon" : "default"}
               className="w-full justify-start h-10 relative text-muted-foreground hover:bg-accent/50 hover:text-foreground"
               onClick={() => {
-                window.location.href = "/dashboard/admin"
+                router.push("/dashboard/admin")
               }}
-              aria-label={collapsed ? item.label : undefined}
+              aria-label={item.label}
+              title={item.label}
             >
               <span className="flex items-center shrink-0 w-5 justify-center">
                 {item.icon}
               </span>
-              {!collapsed && <span>{item.label}</span>}
+              {!collapsed && <span className="sidebar-label">{item.label}</span>}
             </Button>
           );
 
@@ -132,7 +135,9 @@ export function Sidebar({ activeSection, setActiveSection, onNavigate }: Sidebar
                   : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
               )}
               onClick={() => handleNavigation(item)}
-              aria-label={collapsed ? item.label : undefined}
+              aria-label={item.label}
+              title={item.label}
+              aria-current={isActive ? "page" : undefined}
             >
               <span
                 className={cn(
@@ -145,7 +150,7 @@ export function Sidebar({ activeSection, setActiveSection, onNavigate }: Sidebar
               >
                 {item.icon}
               </span>
-              {!collapsed && <span>{item.label}</span>}
+              {!collapsed && <span className="sidebar-label">{item.label}</span>}
               {isActive && (
                 <div
                   className={cn(
@@ -180,16 +185,6 @@ export function Sidebar({ activeSection, setActiveSection, onNavigate }: Sidebar
 
       <div className="p-3 border-t border-border">
         <Button
-          variant={collapsed ? "ghost" : "ghost"}
-          size={collapsed ? "icon" : "default"}
-          className={cn("w-full text-muted-foreground hover:text-foreground", collapsed && "h-10 w-10 mx-auto")}
-          aria-label={collapsed ? "Account" : undefined}
-        >
-          <User className={cn("shrink-0", collapsed ? "w-5 h-5" : "w-4 h-4 mr-2")} />
-          {!collapsed && <span>Account</span>}
-        </Button>
-
-        <Button
           variant="ghost"
           size={collapsed ? "icon" : "default"}
           className={cn(
@@ -197,34 +192,26 @@ export function Sidebar({ activeSection, setActiveSection, onNavigate }: Sidebar
             collapsed && "h-10 w-10 mx-auto"
           )}
           onClick={() => {
-            localStorage.clear();
-            sessionStorage.clear();
-            window.location.href = "/";
+            clearVaultXContext();
+            router.replace("/");
           }}
-          aria-label={collapsed ? "Logout" : undefined}
+          aria-label="Log out"
+          title="Log out"
         >
           <LogOut className={cn("shrink-0", collapsed ? "w-5 h-5" : "w-4 h-4 mr-2")} />
-          {!collapsed && <span>Logout</span>}
+          {!collapsed && <span className="sidebar-label">Log out</span>}
         </Button>
 
-        <Button
-          variant="ghost"
-          size={collapsed ? "icon" : "default"}
-          className={cn("w-full mt-1 text-muted-foreground hover:bg-accent/50", collapsed && "h-10 w-10 mx-auto")}
-          aria-label={collapsed ? "Settings" : undefined}
-        >
-          <Settings className={cn("shrink-0", collapsed ? "w-5 h-5" : "w-4 h-4 mr-2")} />
-          {!collapsed && <span>Settings</span>}
-        </Button>
       </div>
 
-      <div className="p-2 border-t border-border flex justify-center">
+      <div className="sidebar-collapse p-2 border-t border-border flex justify-center">
         <Button
           variant="ghost"
           size="sm"
           className={cn("w-full", collapsed && "h-8 w-8 mx-auto")}
           onClick={() => setCollapsed(!collapsed)}
           aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          aria-expanded={!collapsed}
         >
           {collapsed ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4 mr-2" />}
           {!collapsed && <span>Collapse</span>}

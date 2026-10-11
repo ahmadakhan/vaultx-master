@@ -12,6 +12,7 @@ import ipaddress
 from functools import cached_property
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -46,8 +47,8 @@ class Settings(BaseSettings):
 
     # --- Application ---
     app_env: str = Field("dev", alias="APP_ENV")
-    app_secret_key: str = Field(..., alias="APP_SECRET_KEY", min_length=32)
-    jwt_secret_key: str = Field(..., alias="JWT_SECRET_KEY", min_length=32)
+    app_secret_key: str = Field(..., alias="APP_SECRET_KEY", min_length=32, repr=False)
+    jwt_secret_key: str = Field(..., alias="JWT_SECRET_KEY", min_length=32, repr=False)
     jwt_algorithm: str = Field("HS256", alias="JWT_ALGORITHM")
     jwt_expire_minutes: int = Field(60, alias="JWT_EXPIRE_MINUTES", ge=5, le=1440)
     jwt_refresh_expire_days: int = Field(30, alias="JWT_REFRESH_EXPIRE_DAYS", ge=1, le=365)
@@ -69,14 +70,14 @@ class Settings(BaseSettings):
     db_port: int = Field(5432, alias="DB_PORT", ge=1, le=65535)
     db_name: str = Field(..., alias="DB_NAME")
     db_user: str = Field(..., alias="DB_USER")
-    db_password: str = Field(..., alias="DB_PASSWORD")
-    database_url_override: str | None = Field(default=None, alias="DATABASE_URL")
+    db_password: str = Field(..., alias="DB_PASSWORD", repr=False)
+    database_url_override: str | None = Field(default=None, alias="DATABASE_URL", repr=False)
 
     # --- Mail ---
     mail_host: str = Field(..., alias="MAIL_HOST")
     mail_port: int = Field(587, alias="MAIL_PORT", ge=1, le=65535)
     mail_username: str = Field(..., alias="MAIL_USERNAME")
-    mail_password: str = Field(..., alias="MAIL_PASSWORD")
+    mail_password: str = Field(..., alias="MAIL_PASSWORD", repr=False)
     mail_from: str = Field(..., alias="MAIL_FROM")
     mail_starttls: bool = Field(True, alias="MAIL_STARTTLS")
     mail_ssl_tls: bool = Field(False, alias="MAIL_SSL_TLS")
@@ -105,6 +106,7 @@ class Settings(BaseSettings):
         # Tolerate unrelated keys (e.g. ``PORT``) in a shared/root .env file
         # instead of aborting startup with ``extra_forbidden``.
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     @field_validator("app_env")
@@ -164,8 +166,8 @@ class Settings(BaseSettings):
         if self.database_url_override:
             return self.database_url_override
         return (
-            f"postgresql+asyncpg://{self.db_user}:{self.db_password}"
-            f"@{self.db_host}:{self.db_port}/{self.db_name}"
+            f"postgresql+asyncpg://{quote(self.db_user, safe='')}:{quote(self.db_password, safe='')}"
+            f"@{self.db_host}:{self.db_port}/{quote(self.db_name, safe='')}"
         )
 
     @cached_property

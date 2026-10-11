@@ -18,14 +18,14 @@ from __future__ import annotations
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import get_current_admin
+from app.core.audit_decorator import audit_event
+from app.core.deps import get_current_admin, get_current_user_mfa_verified
 from app.core.exceptions import AuthorizationError, ConflictError, NotFoundError
 from app.core.logging import get_logger
-from app.core.security import hash_password
 from app.db import get_db
 from app.models import TamperLog, User, UserRole
 from app.schemas.admin import (
@@ -38,7 +38,9 @@ from app.schemas.admin import (
 
 logger = get_logger(__name__)
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+router = APIRouter(
+    prefix="/admin", tags=["admin"], dependencies=[Depends(get_current_user_mfa_verified)]
+)
 
 
 @router.get("/users", response_model=list[UserRead])
@@ -59,18 +61,18 @@ async def list_users(
 
     user_reads: list[UserRead] = []
     for u in users:
-        role_result = await db.execute(
-            select(UserRole.role).where(UserRole.user_id == u.id)
-        )
+        role_result = await db.execute(select(UserRole.role).where(UserRole.user_id == u.id))
         roles = [row[0] for row in role_result.fetchall()]
-        user_reads.append(UserRead(
-            id=str(u.id),
-            email=u.email,
-            mfa_enabled=u.mfa_enabled,
-            is_active=u.is_active,
-            created_at=u.created_at,
-            roles=roles,
-        ))
+        user_reads.append(
+            UserRead(
+                id=str(u.id),
+                email=u.email,
+                mfa_enabled=u.mfa_enabled,
+                is_active=u.is_active,
+                created_at=u.created_at,
+                roles=roles,
+            )
+        )
     return user_reads
 
 
@@ -80,62 +82,15 @@ async def create_user(
     current_admin: Annotated[User, Depends(get_current_admin)],
     db: AsyncSession = Depends(get_db),
 ) -> UserRead:
-    """Create a new user (admin-only).
-
-    Unlike self-service registration, this endpoint allows an admin to
-    specify a password directly. The user is created with encrypted key
-    fields left empty — the admin-set password must be changed by the
-    user on first login.
-    """
-    from app.models import email_matches, normalize_email
-    email = normalize_email(payload.email)
-
-    existing = await db.execute(select(User.id).where(email_matches(User.email, email)))
-    if existing.scalar_one_or_none():
-        raise ConflictError("User already exists")
-
-    try:
-        password_hash = hash_password(payload.password)
-    except ValueError as exc:
-        raise AuthorizationError(str(exc)) from exc
-
-    user = User(
-        email=email,
-        password_hash=password_hash,
-        password_salt_b64=b"",
-        enc_master_key_b64=b"",
-        enc_master_key_iv=b"",
-        enc_search_key_b64=b"",
-        enc_search_key_iv=b"",
-        enc_private_key_b64=b"",
-        enc_private_key_iv=b"",
-        public_key_b64=b"",
-        key_bundle_version=1,
-        password_kdf_iterations=150_000,
-    )
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
-
-    if payload.role:
-        db.add(UserRole(user_id=user.id, role=payload.role))
-        await db.commit()
-
-    logger.info("Admin created user", extra={"admin_id": str(current_admin.id), "user_id": str(user.id)})
-
-    return UserRead(
-        id=str(user.id),
-        email=user.email,
-        mfa_enabled=user.mfa_enabled,
-        is_active=user.is_active,
-        created_at=user.created_at,
-        roles=[payload.role] if payload.role else [],
-    )
+    """Reject password-only provisioning: it cannot create a usable vault."""
+    raise ConflictError("Users must register with a client-generated encrypted key bundle")
 
 
 @router.delete("/users/{user_id}")
+@audit_event("user_deactivated", resource_fields=("user_id",))
 async def delete_user(
     user_id: UUID,
+    request: Request,
     current_admin: Annotated[User, Depends(get_current_admin)],
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
@@ -144,12 +99,25 @@ async def delete_user(
     Prevents the user from authenticating again without removing their
     data, preserving audit trail integrity.
     """
-    result = await db.execute(select(User).where(User.id == user_id))
+    if user_id == current_admin.id:
+        raise AuthorizationError("Administrators cannot deactivate themselves")
+    # Serialise administrator changes on the role row, preventing two admins
+    # concurrently deactivating each other after their dependency checks.
+    from app.models import Role
+
+    await db.execute(select(Role).where(Role.name == "admin").with_for_update())
+    await db.refresh(current_admin)
+    if not current_admin.is_active:
+        raise AuthorizationError("Admin access required")
+    result = await db.execute(select(User).where(User.id == user_id).with_for_update())
     user = result.scalar_one_or_none()
     if not user:
         raise NotFoundError("User not found")
 
     user.is_active = False
+    from app.api.routers.auth import _revoke_all_refresh_tokens
+
+    await _revoke_all_refresh_tokens(db, user.id)
     await db.commit()
 
     logger.info(
@@ -216,5 +184,6 @@ async def verify_user_audit_chain(
     Runs the full tamper-detection verification and returns the result.
     """
     from app.core.audit_verify import verify_audit_chain
+
     ok, errors = await verify_audit_chain(db, user_id)
     return AdminAuditVerifyResponse(valid=ok, errors=errors, user_id=str(user_id))

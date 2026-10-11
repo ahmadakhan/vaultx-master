@@ -1,4 +1,5 @@
 "use client"
+import { memorySession } from "@/lib/crypto/context"
 
 import { useState, useEffect, useCallback } from "react"
 import { Shield, Users, Trash2, Plus, Check, X, Loader2, Search, Lock, Calendar, Eye } from "lucide-react"
@@ -92,7 +93,7 @@ export default function AdminPage() {
   }, [])
 
   useEffect(() => {
-    const t = localStorage.getItem("vaultx_access_token")
+    const t = memorySession.getItem("vaultx_access_token")
     if (!mounted || !t) {
       if (!t) router.replace("/")
       return
@@ -102,7 +103,7 @@ export default function AdminPage() {
 
   const loadUsers = useCallback(async () => {
     if (typeof window === "undefined") return
-    const t = localStorage.getItem("vaultx_access_token")
+    const t = memorySession.getItem("vaultx_access_token")
     if (!t) return
     setUsersLoading(true)
     setUsersError(null)
@@ -117,7 +118,7 @@ export default function AdminPage() {
   }, [])
 
   const loadAuditLogs = useCallback(async () => {
-    const t = localStorage.getItem("vaultx_access_token")
+    const t = memorySession.getItem("vaultx_access_token")
     if (!t) return
     setAuditLoading(true)
     setAuditError(null)
@@ -137,7 +138,7 @@ export default function AdminPage() {
     setCreatingUser(true)
     setCreateError(null)
     try {
-      const t = localStorage.getItem("vaultx_access_token")
+      const t = memorySession.getItem("vaultx_access_token")
       if (!t) return
       await api.post(
         "/admin/users",
@@ -160,7 +161,7 @@ export default function AdminPage() {
 
   const handleDeactivateUser = async (userId: string) => {
     if (!confirm("Deactivate this user? They will lose access immediately.")) return
-    const t = localStorage.getItem("vaultx_access_token")
+    const t = memorySession.getItem("vaultx_access_token")
     if (!t) return
     try {
       await api.delete(`/admin/users/${userId}`, t)
@@ -175,7 +176,7 @@ export default function AdminPage() {
     setVerifying(true)
     setVerifyResult(null)
     try {
-      const t = localStorage.getItem("vaultx_access_token")
+      const t = memorySession.getItem("vaultx_access_token")
       if (!t) return
       const res = await api.get(
         `/admin/audit/verify?user_id=${encodeURIComponent(verifyUserId)}`,

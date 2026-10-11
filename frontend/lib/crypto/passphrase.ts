@@ -79,13 +79,9 @@ function base64ToBuf(b64: string): ArrayBuffer {
 }
 
 /**
- * Single source of truth for the passphrase that wraps a share link's file
- * key (Kf) when no access code is set. Both the owner (share-modal) and the
- * guest page (shared/[token]) MUST derive it from the same inputs — the file
- * id alone — otherwise the guest can never decrypt the wrapped key.
- *
- * Note that link confidentiality without an access code rests on the random
- * link token itself, not on this passphrase.
+ * READ-ONLY legacy compatibility. Old links wrapped keys using a public file
+ * ID, so their confidentiality does not survive server/database compromise.
+ * Never use this for new links: generate a random URL-fragment secret instead.
  */
 export function shareLinkPassphrase(fileId: string): string {
   return `vaultx_link_${fileId}_`

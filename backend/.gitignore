@@ -9,7 +9,7 @@ wheels/
 # Virtual environments
 .venv
 .venv/
-storage/
+/storage/
 __pycache__/
 
 # Env files

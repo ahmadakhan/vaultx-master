@@ -3,9 +3,6 @@
 import {
   Eye,
   Download,
-  Pause,
-  Play,
-  Square,
   Share2,
   Trash2,
   MoreHorizontal,
@@ -19,14 +16,13 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Progress } from "@/components/ui/progress";
+import { DownloadTransfer } from "@/components/transfer-stats";
+import type { DownloadProgressInfo } from "@/lib/transfer-ui";
 import { FileIcon } from "@/components/file-icon";
 import type { FileItem } from "@/lib/types";
+import { getSessionContext } from "@/lib/crypto/context";
 
-export interface DownloadProgressInfo {
-  percent: number;
-  status: "downloading" | "paused" | "completed" | "stopped" | "error";
-}
+export type { DownloadProgressInfo } from "@/lib/transfer-ui";
 
 interface FileListProps {
   files: FileItem[];
@@ -51,21 +47,18 @@ export function FileList({
   onStopDownload,
   downloadProgress,
 }: FileListProps) {
-  const current_user =
-    typeof sessionStorage !== "undefined"
-      ? sessionStorage.getItem("vaultx_user_email")
-      : null;
+  const current_user = getSessionContext()?.email ?? null;
 
   return (
-    <div className="p-6">
-      <div className="grid grid-cols-12 gap-4 pb-3 border-b border-border text-xs font-medium uppercase tracking-[0.05em] text-muted-foreground">
-        <div className="col-span-5">Name</div>
-        <div className="col-span-3">Owner</div>
-        <div className="col-span-3">Modified</div>
-        <div className="col-span-1 text-right">Size</div>
+    <div className="p-4 sm:p-6">
+      <div className="grid grid-cols-[minmax(0,1fr)_auto] lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(0,1fr)_10rem] gap-4 px-2 pb-3 border-b border-border text-xs font-medium uppercase tracking-[0.05em] text-muted-foreground">
+        <div>Name</div>
+        <div className="hidden lg:block">Owner</div>
+        <div className="hidden lg:block">Modified</div>
+        <div className="text-right">Size / Actions</div>
       </div>
 
-      <div className="space-y-1">
+      <div role="list" aria-label="Files" className="space-y-1">
         {files.map((file) => (
           <Row
             key={file.id}
@@ -111,17 +104,20 @@ function Row({
 }) {
   const displayOwner = isCurrentUser ? "You" : file.owner;
   const dl = downloadProgress;
-  const showProgress = dl && dl.status !== "completed" && dl.status !== "stopped";
+  const showProgress = !!dl;
 
   return (
-    <div className="grid grid-cols-12 gap-4 items-center group py-3 px-2 rounded-lg hover:bg-accent/50 transition-colors">
-      <div
-        className="col-span-5 flex items-center space-x-3 min-w-0"
+     <div role="listitem" className="grid grid-cols-[minmax(0,1fr)_auto] lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(0,1fr)_10rem] gap-4 items-center group py-3 px-2 border-b border-border/60 hover:bg-accent/50 transition-colors">
+      <button
+        type="button"
+        aria-label={`View details for ${file.name}`}
+        disabled={!onViewFile || dl?.status === "downloading" || dl?.status === "paused"}
+        className="flex items-center space-x-3 min-w-0 text-left rounded-md disabled:cursor-default"
         onClick={dl?.status === "downloading" || dl?.status === "paused" ? undefined : () => onViewFile?.(file)}
       >
         <FileIcon fileType={file.fileType} name={file.name} className="w-6 h-6 flex-shrink-0" />
-        <div className="flex items-center space-x-2 min-w-0">
-          <span className="text-sm font-medium text-foreground truncate">
+        <span className="flex flex-wrap items-center gap-2 min-w-0">
+          <span title={file.name} className="text-sm font-medium text-foreground truncate">
             {file.name}
           </span>
           {file.shared && (
@@ -132,64 +128,34 @@ function Row({
               Shared
             </Badge>
           )}
-        </div>
-      </div>
+        </span>
+      </button>
 
-      <div className="col-span-3 flex items-center text-sm text-muted-foreground truncate">
+      <div title={displayOwner} className="hidden lg:block text-sm text-muted-foreground truncate">
         {displayOwner}
       </div>
 
-      <div className="col-span-3 flex items-center text-sm text-muted-foreground truncate">
+      <div title={file.modified} className="hidden lg:block text-sm text-muted-foreground truncate">
         {file.modified}
       </div>
 
-      <div className="col-span-1 flex items-center justify-end">
-        {showProgress ? (
-          <div className="flex items-center gap-1 w-24">
-            <Progress value={dl!.percent} className="h-1 flex-1" />
-            {dl!.status === "downloading" && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-5 w-5 p-0"
-                onClick={() => onPauseDownload?.(file.id)}
-              >
-                <Pause className="w-3 h-3" strokeWidth={1.5} />
-              </Button>
-            )}
-            {dl!.status === "paused" && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-5 w-5 p-0"
-                onClick={() => onResumeDownload?.(file.id)}
-              >
-                <Play className="w-3 h-3" strokeWidth={1.5} />
-              </Button>
-            )}
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-5 w-5 p-0"
-              onClick={() => onStopDownload?.(file.id)}
-            >
-              <Square className="w-3 h-3" strokeWidth={1.5} />
-            </Button>
-          </div>
-        ) : (
+      <div className="flex items-center justify-end gap-2">
+        {!showProgress && <span className="text-xs text-muted-foreground tabular-nums whitespace-nowrap">{file.size}</span>}
+        {(
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-7 w-7 opacity-0 group-hover:opacity-100 text-muted-foreground hover:bg-accent/50"
-                aria-label="More actions"
+                className="h-11 w-11 text-muted-foreground hover:bg-accent/50"
+                aria-label={`Actions for ${file.name}`}
               >
                 <MoreHorizontal className="w-4 h-4" strokeWidth={1.5} />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-40">
               <DropdownMenuItem
+                disabled={!onViewFile}
                 onSelect={() => onViewFile?.(file)}
                 className="cursor-pointer focus:bg-accent/50"
               >
@@ -197,6 +163,7 @@ function Row({
                 <span>Details</span>
               </DropdownMenuItem>
               <DropdownMenuItem
+                disabled={!onDownloadFile || !!dl && ["downloading", "pausing", "paused", "decrypting"].includes(dl.status)}
                 onSelect={() => onDownloadFile?.(file.id)}
                 className="cursor-pointer focus:bg-accent/50"
               >
@@ -206,6 +173,7 @@ function Row({
               {!file.is_shared_with_me && (
                 <>
                   <DropdownMenuItem
+                    disabled={!onShareFile}
                     onSelect={() => onShareFile?.(file.id)}
                     className="cursor-pointer focus:bg-accent/50"
                   >
@@ -214,6 +182,7 @@ function Row({
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
                   <DropdownMenuItem
+                    disabled={!onDeleteFile}
                     onSelect={() => onDeleteFile?.(file.id)}
                     className="text-destructive focus:text-destructive cursor-pointer focus:bg-destructive/10"
                   >
@@ -226,6 +195,7 @@ function Row({
           </DropdownMenu>
         )}
       </div>
+      {showProgress && <div className="col-span-full"><DownloadTransfer name={file.name} progress={dl!} onPause={() => onPauseDownload?.(file.id)} onResume={() => onResumeDownload?.(file.id)} onAbort={() => onStopDownload?.(file.id)} /></div>}
     </div>
   );
 }

@@ -7,10 +7,10 @@ FROM node:20-alpine AS deps
 WORKDIR /app
 
 # Copy dependency manifests
-COPY package*.json ./
+COPY package.json pnpm-lock.yaml ./
 
 # Install all deps including dev (required for build)
-RUN npm install
+RUN corepack enable && corepack pnpm install --frozen-lockfile
 
 # ---- Stage 2: Build ----
 FROM node:20-alpine AS builder

@@ -1,18 +1,25 @@
 import { bufToB64, b64ToBuf, genRandomBytes } from "./base";
 
-const PBKDF2_ITERATIONS = 150000;
+// Existing account bundle format: changing this without a persisted KDF
+// version would make all existing accounts undecryptable.
+export const ACCOUNT_PBKDF2_ITERATIONS = 150000;
+export const CURRENT_ACCOUNT_PBKDF2_ITERATIONS = 600000;
 const AES_KEY_LEN = 256;
 
-export async function deriveMasterKey(password: string, salt_b64?: string) {
+export async function deriveMasterKey(password: string, salt_b64?: string, iterations = ACCOUNT_PBKDF2_ITERATIONS) {
+  if (!Number.isSafeInteger(iterations) || iterations < ACCOUNT_PBKDF2_ITERATIONS || iterations > 10000000) {
+    throw new Error("Unsupported password KDF parameters")
+  }
   const enc = new TextEncoder();
   const pwKey = await crypto.subtle.importKey("raw", enc.encode(password), { name: "PBKDF2" }, false, ["deriveKey"]);
 
   let salt: Uint8Array<ArrayBuffer>;
   if (salt_b64) salt = new Uint8Array(b64ToBuf(salt_b64));
   else salt = new Uint8Array(genRandomBytes(16).buffer as ArrayBuffer);
+  if (salt.byteLength !== 16) throw new Error("Invalid password salt")
 
   const key = await crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
+    { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
     pwKey,
     { name: "AES-GCM", length: AES_KEY_LEN },
     false,

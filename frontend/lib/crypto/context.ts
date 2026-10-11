@@ -4,55 +4,54 @@ export interface VaultXContext {
   searchKey_b64: string
   privateKey_b64: string
   publicKey_b64: string
+  email?: string
 }
 
-// In-memory session store. Keys are intentionally NOT persisted to
-// localStorage/sessionStorage because any XSS can read those stores and
-// exfiltrate the entire vault. Keeping keys in a module-scoped variable makes
-// them invisible to JavaScript running outside this bundle.
-let _ctx: VaultXContext | null = null
+// Memory-only, tab-local unlocked state. This limits persistence; it does not
+// protect an unlocked session against JavaScript already executing in the app.
+let context: VaultXContext | null = null
+const values = new Map<string, string>()
+export const memorySession = {
+  getItem: (key: string): string | null => values.get(key) ?? null,
+  setItem: (key: string, value: string): void => { values.set(key, value) },
+  removeItem: (key: string): void => { values.delete(key) },
+}
+
+function removeLegacyStorage(): void {
+  if (typeof window === "undefined") return
+  for (const name of ["localStorage", "sessionStorage"] as const) {
+    try {
+      const storage = window[name]
+      for (let i = storage.length - 1; i >= 0; i--) {
+        const key = storage.key(i)
+        if (key?.startsWith("vaultx_")) storage.removeItem(key)
+      }
+    } catch { /* Storage may be disabled. It is never needed for login. */ }
+  }
+}
 
 export function setVaultXContext(ctx: VaultXContext): void {
-  _ctx = ctx
+  removeLegacyStorage()
+  values.clear()
+  context = ctx
+  memorySession.setItem("vaultx_access_token", ctx.accessToken)
+  memorySession.setItem("vaultx_master_key", ctx.masterKey_b64)
+  memorySession.setItem("vaultx_search_key", ctx.searchKey_b64)
+  memorySession.setItem("vaultx_private_key", ctx.privateKey_b64)
+  memorySession.setItem("vaultx_public_key", ctx.publicKey_b64)
 }
 
-/**
- * Rebuild the context after a page reload. The access token lives in
- * localStorage and the unlocked key material in sessionStorage (written at
- * login); this repopulates the in-memory context from those stores so that
- * `getVaultXContext()` keeps working across refreshes.
- */
-function rehydrateVaultXContext(): VaultXContext | null {
-  if (typeof window === "undefined") return null
-  const accessToken = localStorage.getItem("vaultx_access_token")
-  if (!accessToken) return null
-  return {
-    accessToken,
-    masterKey_b64: sessionStorage.getItem("vaultx_master_key") || "",
-    searchKey_b64: sessionStorage.getItem("vaultx_search_key") || "",
-    privateKey_b64: sessionStorage.getItem("vaultx_private_key") || "",
-    publicKey_b64: sessionStorage.getItem("vaultx_public_key") || "",
-  }
+export function getSessionContext(): VaultXContext | null {
+  return context
 }
 
 export function getVaultXContext(): VaultXContext {
-  if (!_ctx) {
-    _ctx = rehydrateVaultXContext()
-  }
-  if (!_ctx) {
-    throw new Error("Session expired — please log in again.")
-  }
-  return _ctx
+  if (!context) throw new Error("Vault locked — please log in again. Reloading locks your vault.")
+  return context
 }
 
 export function clearVaultXContext(): void {
-  _ctx = null
-  // Best-effort cleanup of any legacy storage from previous versions.
-  localStorage.removeItem("vaultx_access_token")
-  sessionStorage.removeItem("vaultx_master_key")
-  sessionStorage.removeItem("vaultx_search_key")
-  sessionStorage.removeItem("vaultx_private_key")
-  sessionStorage.removeItem("vaultx_public_key")
-  sessionStorage.removeItem("vaultx_keyword_chain")
-  sessionStorage.removeItem("vaultx_user_email")
+  context = null
+  values.clear()
+  removeLegacyStorage()
 }

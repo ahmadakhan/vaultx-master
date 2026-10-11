@@ -1,7 +1,8 @@
 "use client";
+import { memorySession, getSessionContext } from "@/lib/crypto/context";
 
 import { useState, useCallback, useEffect, useRef } from "react";
-import { UploadCloud, Pause, Play, Square } from "lucide-react";
+import { UploadCloud } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Sidebar } from "@/components/sidebar";
 import { FileGrid } from "@/components/file-grid";
@@ -16,7 +17,6 @@ import { ViewToggle } from "@/components/view-toggle";
 import { SortSelect, applySort } from "@/components/sort-select";
 import { DashboardLayout } from "@/components/dashboard-layout";
 import { Logs } from "@/components/logs";
-import { Progress } from "@/components/ui/progress";
 import { Trash } from "./trash";
 import { MfaSettings } from "@/components/mfa-settings";
 import { decryptBytesWithAes, decryptStringWithAes } from "@/lib/crypto/aes";
@@ -26,10 +26,12 @@ import { b64ToBuf, bufToB64 } from "@/lib/crypto/base";
 import { decryptChunkedGCM } from "@/lib/crypto/chunking";
 import type { FileItem, RawFile } from "@/lib/types";
 import { errorMessage } from "@/lib/types";
+import type { DownloadProgressInfo } from "@/lib/transfer-ui";
 
 export function FileManager() {
   const [viewMode, setViewMode] = useState<"grid" | "list">("list");
   const [uploadModalOpen, setUploadModalOpen] = useState(false);
+  const [droppedFiles, setDroppedFiles] = useState<File[]>([]);
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [detailModalOpen, setDetailModalOpen] = useState(false);
   const [shareFileId, setShareFileId] = useState<string | null>(null);
@@ -42,14 +44,15 @@ export function FileManager() {
   const [sortKey, setSortKey] = useState("modified-desc");
 
   const [activeSection, setActiveSection] = useState("My Vault");
-  const [downloadProgress, setDownloadProgress] = useState<Record<string, { percent: number; status: "downloading" | "paused" | "completed" | "stopped" | "error" }>>({});
-  const [pausedDownloads, setPausedDownloads] = useState<Record<string, { received: number; total: number; chunks: Uint8Array[] }>>({});
+  const [downloadProgress, setDownloadProgress] = useState<Record<string, DownloadProgressInfo>>({});
+  const pausedDownloads = useRef<Record<string, { received: number; total: number; chunks: Uint8Array[]; activeMs: number }>>({});
+  const downloadIntent = useRef<Record<string, "pause" | "stop">>({});
   const abortControllers = useRef<Record<string, AbortController>>({});
   const suppressNextFetch = useRef(false);
 
   const decryptFiles = useCallback(async (filesRaw: RawFile[]) => {
-    const masterKey_b64 = sessionStorage.getItem("vaultx_master_key");
-    const privateKey_b64 = sessionStorage.getItem("vaultx_private_key");
+    const masterKey_b64 = memorySession.getItem("vaultx_master_key");
+    const privateKey_b64 = memorySession.getItem("vaultx_private_key");
     if (!masterKey_b64 || !privateKey_b64)
       throw new Error("Missing master or private key — please log in again.");
 
@@ -91,7 +94,7 @@ export function FileManager() {
 
         if (!kf_b64) continue;
 
-        sessionStorage.setItem(`vaultx_kf_${f.id}`, kf_b64);
+        memorySession.setItem(`vaultx_kf_${f.id}`, kf_b64);
 
         const metadataJson = await decryptStringWithAes(
           f.metadata_ciphertext,
@@ -103,6 +106,8 @@ export function FileManager() {
         decryptedFiles.push({
           id: f.id,
           name: meta.name || "Untitled",
+          plaintextSize: meta.size,
+          chunkSize: meta.chunk_size,
           type: "file",
           fileType: meta.type || "unknown",
           size: meta.size ? `${(meta.size / 1024).toFixed(2)} KB` : "—",
@@ -192,7 +197,7 @@ export function FileManager() {
           return;
         }
 
-        const chainJson = sessionStorage.getItem("vaultx_keyword_chain");
+        const chainJson = memorySession.getItem("vaultx_keyword_chain");
         if (!chainJson)
           throw new Error(
             "No keyword chain found. Try uploading a file first."
@@ -218,7 +223,7 @@ export function FileManager() {
           return;
         }
 
-        const searchKey_b64 = sessionStorage.getItem("vaultx_search_key");
+        const searchKey_b64 = memorySession.getItem("vaultx_search_key");
         if (!searchKey_b64) throw new Error("Missing search key.");
 
         const decryptedIds: string[] = [];
@@ -255,8 +260,6 @@ export function FileManager() {
     [decryptFiles, fetchAllFiles, activeSection]
   );
 
-  const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
-
   const _mergeChunks = (chunks: Uint8Array[], total: number): ArrayBuffer => {
     const result = new Uint8Array(total);
     let offset = 0;
@@ -282,31 +285,28 @@ export function FileManager() {
   };
 
   const handlePauseDownload = (id: string) => {
+    downloadIntent.current[id] = "pause";
     const controller = abortControllers.current[id];
     if (controller) {
       controller.abort();
     }
     setDownloadProgress((prev) => ({
       ...prev,
-      [id]: { ...prev[id], status: "paused" },
+      [id]: { ...prev[id], status: "pausing" },
     }));
   };
 
   const handleStopDownload = (id: string) => {
+    downloadIntent.current[id] = "stop";
     const controller = abortControllers.current[id];
     if (controller) {
       controller.abort();
     }
     setDownloadProgress((prev) => ({
       ...prev,
-      [id]: { percent: 0, status: "stopped" },
+      [id]: { ...prev[id], status: "stopped" },
     }));
-    setPausedDownloads((prev) => {
-      const rest = { ...prev };
-      delete rest[id];
-      return rest;
-    });
-    delete abortControllers.current[id];
+    delete pausedDownloads.current[id];
   };
 
   const handleResumeDownload = async (id: string) => {
@@ -317,8 +317,9 @@ export function FileManager() {
   };
 
    const downloadFile = useCallback(async (file: FileItem, fileId: string, isResume: boolean = false) => {
-    const ctx = getVaultXContext();
-    if (!ctx.accessToken) {
+    if (abortControllers.current[fileId] || (!isResume && pausedDownloads.current[fileId])) return;
+    const ctx = getSessionContext();
+    if (!ctx?.accessToken) {
       clearVaultXContext();
       alert("Please log in again.");
       window.location.href = "/";
@@ -327,10 +328,15 @@ export function FileManager() {
 
     const controller = new AbortController();
     abortControllers.current[fileId] = controller;
+    delete downloadIntent.current[fileId];
+    const started = performance.now();
+    const saved = isResume ? pausedDownloads.current[fileId] : undefined;
+    let previousMs = saved?.activeMs ?? 0;
+    const activeMs = () => previousMs + performance.now() - started;
 
     setDownloadProgress((prev) => ({
       ...prev,
-      [fileId]: { percent: 0, status: "downloading" },
+      [fileId]: { percent: saved && saved.total > 0 ? saved.received / saved.total * 100 : 0, bytes: saved?.received ?? 0, total: saved?.total ?? 0, activeMs: previousMs, status: "downloading" },
     }));
 
     let totalBytes = 0;
@@ -344,11 +350,20 @@ export function FileManager() {
     let receivedChunks: Uint8Array[] = [];
     let receivedBytes = 0;
 
-    if (isResume && pausedDownloads[fileId]) {
-      receivedBytes = pausedDownloads[fileId].received;
-      receivedChunks = [...pausedDownloads[fileId].chunks];
+    if (saved) {
+      receivedBytes = saved.received;
+      receivedChunks = [...saved.chunks];
       rangeStart = receivedBytes;
     }
+    const settleCancellation = () => {
+      if (!controller.signal.aborted) return false;
+      if (downloadIntent.current[fileId] === "pause") {
+        pausedDownloads.current[fileId] = { received: receivedBytes, total: totalBytes, chunks: receivedChunks, activeMs: activeMs() };
+        setDownloadProgress((prev) => ({ ...prev, [fileId]: { percent: totalBytes > 0 ? receivedBytes / totalBytes * 100 : 0, bytes: receivedBytes, total: totalBytes, activeMs: activeMs(), status: "paused" } }));
+      }
+      delete abortControllers.current[fileId];
+      return true;
+    };
 
     try {
       const rangeHeader = `bytes=${rangeStart}-`;
@@ -358,7 +373,15 @@ export function FileManager() {
         rangeHeader
       );
 
-      if (res.status === 206) {
+      if (res.status === 206 || res.headers.get("Content-Type")?.includes("application/octet-stream")) {
+        // A server may ignore Range and send the whole body. Never append that
+        // body to previously downloaded bytes.
+        if (res.status !== 206) {
+          receivedChunks = [];
+          receivedBytes = 0;
+          previousMs = 0;
+          totalBytes = Number(res.headers.get("Content-Length")) || 0;
+        }
         file_iv = res.headers.get("X-File-Iv") || "";
         encrypted_kf_b64 = res.headers.get("X-Encrypted-Kf");
         encrypted_kf_iv = res.headers.get("X-Encrypted-Kf-Iv") || null;
@@ -377,17 +400,8 @@ export function FileManager() {
 
         while (true) {
           if (controller.signal.aborted) {
-            setPausedDownloads((prev) => ({
-              ...prev,
-              [fileId]: { received: receivedBytes, total: totalBytes, chunks: receivedChunks },
-            }));
-            setDownloadProgress((prev) => ({
-              ...prev,
-              [fileId]: {
-                percent: totalBytes > 0 ? Math.round((receivedBytes / totalBytes) * 100) : 0,
-                status: "paused",
-              },
-            }));
+            await reader.cancel();
+            settleCancellation();
             return;
           }
 
@@ -397,10 +411,10 @@ export function FileManager() {
           receivedChunks.push(value);
           receivedBytes += value.length;
 
-          const percent = totalBytes > 0 ? Math.round((receivedBytes / totalBytes) * 100) : 0;
+           const percent = totalBytes > 0 ? (receivedBytes / totalBytes) * 100 : 0;
           setDownloadProgress((prev) => ({
             ...prev,
-            [fileId]: { percent, status: "downloading" },
+            [fileId]: { percent, bytes: receivedBytes, total: totalBytes, activeMs: activeMs(), status: controller.signal.aborted ? downloadIntent.current[fileId] === "stop" ? "stopped" : "pausing" : "downloading" },
           }));
         }
 
@@ -413,21 +427,22 @@ export function FileManager() {
         encrypted_kf_iv = data.encrypted_kf_iv;
         wrapped_key_b64 = data.wrapped_key_b64;
         totalBytes = ciphertext.byteLength;
+        receivedBytes = totalBytes;
       }
     } catch (err) {
-      if (controller.signal.aborted) return;
-      console.error("Download stream failed, falling back to JSON:", err);
-      const data = await api.get(`/files/${fileId}/download`, ctx.accessToken);
-      ciphertext = b64ToBuf(data.ciphertext) as ArrayBuffer;
-      file_iv = data.file_iv;
-      encrypted_kf_b64 = data.encrypted_kf_b64;
-      encrypted_kf_iv = data.encrypted_kf_iv;
-      wrapped_key_b64 = data.wrapped_key_b64;
-      totalBytes = ciphertext.byteLength;
+      if (settleCancellation()) return;
+      setError(errorMessage(err, "Download failed"));
+      setDownloadProgress(prev => ({ ...prev, [fileId]: { percent: 0, status: "error" } }));
+      delete abortControllers.current[fileId];
+      return;
     }
 
+    if (settleCancellation()) return;
+    delete pausedDownloads.current[fileId];
+    const measuredMs = activeMs();
+    setDownloadProgress((prev) => ({ ...prev, [fileId]: { percent: 100, bytes: receivedBytes, total: totalBytes, activeMs: measuredMs, status: "decrypting" } }));
     try {
-      const masterKey_b64 = sessionStorage.getItem("vaultx_master_key");
+      const masterKey_b64 = memorySession.getItem("vaultx_master_key");
       if (!masterKey_b64) throw new Error("Missing master key — please log in again.");
 
       let kf_b64: string | null = null;
@@ -440,7 +455,7 @@ export function FileManager() {
         );
         kf_b64 = bufToB64(kf_bytes.buffer);
       } else if (wrapped_key_b64) {
-        const privateKeyPem = sessionStorage.getItem("vaultx_private_key");
+        const privateKeyPem = memorySession.getItem("vaultx_private_key");
         if (!privateKeyPem) throw new Error("Missing RSA private key — please log in again.");
 
         const privateKey = await window.crypto.subtle.importKey(
@@ -463,7 +478,7 @@ export function FileManager() {
         throw new Error("No valid key material found for this file.");
       }
 
-      if (controller.signal.aborted) return;
+      if (settleCancellation()) return;
 
       const fileKey = await crypto.subtle.importKey(
         "raw",
@@ -475,7 +490,8 @@ export function FileManager() {
 
       // Segment-wise GCM decryption: files are sealed chunk-by-chunk, each
       // chunk with an IV derived from the persisted file nonce + index.
-      const decryptedBytes = await decryptChunkedGCM(ciphertext!, fileKey, file_iv);
+      const decryptedBytes = await decryptChunkedGCM(ciphertext!, fileKey, file_iv, file.chunkSize, file.plaintextSize);
+      if (settleCancellation()) return;
 
       const blob = new Blob([decryptedBytes]);
       const url = window.URL.createObjectURL(blob);
@@ -489,21 +505,14 @@ export function FileManager() {
 
       setDownloadProgress((prev) => ({
         ...prev,
-        [fileId]: { percent: 100, status: "completed" },
+        [fileId]: { percent: 100, bytes: receivedBytes, total: totalBytes, activeMs: measuredMs, status: "completed" },
       }));
       delete abortControllers.current[fileId];
-      setTimeout(() => {
-        setDownloadProgress((prev) => {
-          const rest = { ...prev };
-          delete rest[fileId];
-          return rest;
-        });
-      }, 2000);
     } catch (err) {
       // Everything after the streaming phase (key unwrap, decryption, blob
       // creation) must surface failures instead of dying as an unhandled
       // rejection with the spinner stuck on "downloading".
-      if (controller.signal.aborted) return;
+      if (settleCancellation()) return;
       console.error("Download failed:", err);
       alert(errorMessage(err, "Download failed"));
       setDownloadProgress((prev) => ({
@@ -511,15 +520,8 @@ export function FileManager() {
         [fileId]: { percent: 0, status: "error" },
       }));
       delete abortControllers.current[fileId];
-      setTimeout(() => {
-        setDownloadProgress((prev) => {
-          const rest = { ...prev };
-          delete rest[fileId];
-          return rest;
-        });
-      }, 3000);
     }
-  }, [pausedDownloads]);
+  }, []);
 
   const handleDeleteFile = async (id: string) => {
     const file = files.find((f) => f.id === id);
@@ -632,6 +634,8 @@ export function FileManager() {
           onDrop={(e) => {
             e.preventDefault();
             setIsDragOver(false);
+            if (uploadModalOpen) return;
+            setDroppedFiles(Array.from(e.dataTransfer.files));
             setUploadModalOpen(true);
           }}
         >
@@ -641,7 +645,7 @@ export function FileManager() {
             <Trash />
           ) : activeSection === "Security" ? (
             <div className="flex-1 overflow-y-auto">
-              <div className="border-b border-border bg-card px-6 py-4 shadow-sm">
+              <div className="border-b border-border bg-card px-6 py-4">
                 <h1 className="text-xl font-semibold text-foreground">Security</h1>
                 <p className="text-sm text-muted-foreground mt-1">
                   Manage your account security settings.
@@ -653,8 +657,8 @@ export function FileManager() {
             </div>
           ) : (
             <>
-              <div className="border-b border-border bg-card px-6 py-4 flex items-center justify-between shadow-sm">
-                <div className="flex items-center gap-4">
+              <div className="border-b border-border bg-card px-4 sm:px-6 py-4 flex flex-wrap gap-3 items-center justify-between">
+                <div className="flex flex-wrap items-center gap-4">
                   <h1 className="text-xl font-semibold text-foreground">
                     {activeSection === "Shared with Me"
                       ? "Shared with Me"
@@ -666,7 +670,7 @@ export function FileManager() {
                   </span>
                 </div>
 
-                <div className="flex items-center gap-3">
+                <div className="flex flex-wrap items-center gap-3">
                   {activeSection === "My Vault" && (
                     <>
                       <ViewToggle value={viewMode} onChange={setViewMode} />
@@ -699,6 +703,7 @@ export function FileManager() {
           )}
 
           <UploadModal
+            initialFiles={droppedFiles}
             open={uploadModalOpen}
             onOpenChange={setUploadModalOpen}
             onUploadSuccess={fetchAllFiles}

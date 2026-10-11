@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useEffect } from "react";
 import {
   Dialog,
   DialogContent,
@@ -11,7 +11,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Progress } from "@/components/ui/progress";
+import { TransferStats } from "@/components/transfer-stats";
 import { Badge } from "@/components/ui/badge";
 import {
   UploadCloud,
@@ -30,21 +30,19 @@ import { bufToB64, genRandomBytes } from "@/lib/crypto/base";
 import { CHUNK_SIZE, buildChunkIv } from "@/lib/crypto/chunking";
 import { api } from "@/lib/api";
 import { errorMessage } from "@/lib/types";
-import { v4 as uuidv4 } from "uuid";
-import { clearVaultXContext } from "@/lib/crypto/context";
-import * as XLSX from "xlsx";
+import { memorySession } from "@/lib/crypto/context";
 import mammoth from "mammoth";
 
 interface UploadFile {
   id: string;
   file: File;
   progress: number;
-  status: "pending" | "uploading" | "paused" | "completed" | "error" | "stopped";
+  status: "preparing" | "pending" | "uploading" | "pausing" | "paused" | "completed" | "error" | "stopped";
+  activeMs?: number;
   errorMessage?: string;
   selectedKeywords?: string[];
   autoKeywords?: string[];
   uploadedBytes: number;
-  abortController?: AbortController;
   pausedAtChunk: number;
   totalChunks: number;
   fileKey_b64?: string;
@@ -60,6 +58,7 @@ interface UploadModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onUploadSuccess?: () => void;
+  initialFiles?: File[];
 }
 
 async function extractKeywordsFromFile(file: File): Promise<string[]> {
@@ -93,6 +92,9 @@ function getTypeKeywords(type: string, name: string): string[] {
 
 async function readFileContent(file: File): Promise<string> {
   const lower = file.name.toLowerCase();
+  // Content indexing is optional; bound parser input independently of upload
+  // size so large files do not exhaust the tab before encryption starts.
+  if (file.size > 10 * 1024 * 1024) return "";
 
   try {
     if (file.type.startsWith("text/") || lower.endsWith(".json") || lower.endsWith(".csv")) {
@@ -101,8 +103,7 @@ async function readFileContent(file: File): Promise<string> {
 
     if (file.type === "application/pdf" || lower.endsWith(".pdf")) {
       const pdfjsLib = await import("pdfjs-dist/webpack");
-      pdfjsLib.GlobalWorkerOptions.workerSrc =
-        "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.6.82/build/pdf.worker.min.mjs";
+      // webpack entry bundles its matching worker locally.
 
       const pdf = await pdfjsLib
         .getDocument({ data: await file.arrayBuffer() })
@@ -124,14 +125,8 @@ async function readFileContent(file: File): Promise<string> {
       return result.value || "";
     }
 
-    if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) {
-      const data = await file.arrayBuffer();
-      const workbook = XLSX.read(data, { type: "array" });
-      const text = workbook.SheetNames.map(
-        (sheet) => XLSX.utils.sheet_to_csv(workbook.Sheets[sheet])
-      ).join(" ");
-      return text;
-    }
+    // Spreadsheet uploads retain filename/type keywords. Avoid parsing
+    // untrusted workbooks with the unmaintained npm xlsx distribution.
 
     return "";
   } catch {
@@ -147,7 +142,7 @@ function getTopKeywords(text: string, max: number): string[] {
     .split(/\s+/)
     .filter((w) => w.length > 3);
 
-  const freq: Record<string, number> = {};
+  const freq: Record<string, number> = Object.create(null);
   for (const w of words) freq[w] = (freq[w] || 0) + 1;
 
   const stopWords = new Set([
@@ -171,22 +166,42 @@ function formatSize(b: number) {
   return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModalProps) {
-  const [uploadFiles, setUploadFiles] = useState<UploadFile[]>([]);
+export function UploadModal({ open, onOpenChange, onUploadSuccess, initialFiles }: UploadModalProps) {
+  const [uploadFiles, renderUploadFiles] = useState<UploadFile[]>([]);
+  // Synchronous ownership/state guards also cover clicks before React renders.
+  const filesRef = useRef<UploadFile[]>([]);
+  const workerActive = useRef(false);
+  const setUploadFiles = (update: UploadFile[] | ((files: UploadFile[]) => UploadFile[])) => {
+    filesRef.current = typeof update === "function" ? update(filesRef.current) : update;
+    renderUploadFiles(filesRef.current);
+  };
   const [globalKeywords, setGlobalKeywords] = useState<string[]>([]);
   const [currentKeyword, setCurrentKeyword] = useState("");
   const [isUploading, setIsUploading] = useState(false);
-  const dropZoneRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [dragActive, setDragActive] = useState(false);
+  const [queueError, setQueueError] = useState<string | null>(null);
+  const clocks = useRef<Record<string, { started: number; elapsed: number }>>({});
+  const lastBatch = useRef<File[] | undefined>(undefined);
+  useEffect(() => {
+    if (initialFiles && initialFiles !== lastBatch.current) {
+      lastBatch.current = initialFiles;
+      void addFiles(initialFiles);
+    }
+  });
 
   const resetModal = () => {
     setUploadFiles([]);
     setGlobalKeywords([]);
     setCurrentKeyword("");
     setIsUploading(false);
+    setQueueError(null);
+    clocks.current = {};
   };
 
   const closeModal = (openState: boolean) => {
-    if (!openState && !isUploading) {
+    if (!openState && workerActive.current) return;
+    if (!openState) {
       resetModal();
     }
     onOpenChange(openState);
@@ -194,39 +209,25 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
-    dropZoneRef.current?.classList.add("drop-active");
+    if (!workerActive.current) setDragActive(true);
   };
 
   const handleDragLeave = (e: React.DragEvent) => {
     e.preventDefault();
-    dropZoneRef.current?.classList.remove("drop-active");
+    setDragActive(false);
   };
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
-    dropZoneRef.current?.classList.remove("drop-active");
-    addFiles(Array.from(e.dataTransfer.files));
+    e.stopPropagation();
+    setDragActive(false);
+    void addFiles(Array.from(e.dataTransfer.files));
   };
 
   async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files || []);
-    const newFiles = await Promise.all(
-      files.map(async (file) => {
-        const autoKeywords = await extractKeywordsFromFile(file);
-        return {
-          id: crypto.randomUUID(),
-          file,
-          autoKeywords,
-          selectedKeywords: [...autoKeywords],
-          status: "pending" as const,
-          progress: 0,
-          uploadedBytes: 0,
-          pausedAtChunk: 0,
-          totalChunks: Math.ceil(file.size / CHUNK_SIZE) || 1,
-        };
-      })
-    );
-    setUploadFiles((prev) => [...prev, ...newFiles]);
+    e.target.value = "";
+    await addFiles(files);
   }
 
   function handleToggleKeyword(fileId: string, kw: string) {
@@ -242,17 +243,35 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
     );
   }
 
-  const addFiles = (files: File[]) => {
-    const newFiles = files.map((file) => ({
-      id: uuidv4(),
+  const addFiles = async (files: File[]) => {
+    if (workerActive.current) return;
+    const seen = new Set(filesRef.current.map(({ file }) => `${file.name}:${file.size}:${file.lastModified}`));
+    const unique = files.filter((file) => {
+      const key = `${file.name}:${file.size}:${file.lastModified}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    setQueueError(unique.length < files.length ? "Duplicate selections skipped." : null);
+    const newFiles = unique.map((file) => ({
+      id: crypto.randomUUID(),
       file,
       progress: 0,
-      status: "pending" as const,
+      status: "preparing" as const,
       uploadedBytes: 0,
       pausedAtChunk: 0,
       totalChunks: Math.ceil(file.size / CHUNK_SIZE) || 1,
     }));
     setUploadFiles((prev) => [...prev, ...newFiles]);
+    for (const item of newFiles) {
+      if (!filesRef.current.some((f) => f.id === item.id && f.status === "preparing")) continue;
+      try {
+        const autoKeywords = await extractKeywordsFromFile(item.file);
+        setUploadFiles((prev) => prev.map((f) => f.id === item.id && f.status === "preparing" ? { ...f, autoKeywords, selectedKeywords: autoKeywords, status: "pending" } : f));
+      } catch (error) {
+        setUploadFiles((prev) => prev.map((f) => f.id === item.id && f.status === "preparing" ? { ...f, status: "error", errorMessage: errorMessage(error, "Could not prepare file") } : f));
+      }
+    }
   };
 
   const handleAddKeyword = () => {
@@ -274,94 +293,81 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
   };
 
   const handlePauseUpload = (fileId: string) => {
-    const file = uploadFiles.find((f) => f.id === fileId);
-    if (!file || !file.abortController) return;
-    file.abortController.abort();
     setUploadFiles((prev) =>
-      prev.map((f) => (f.id === fileId ? { ...f, status: "paused" } : f))
+      prev.map((f) => (f.id === fileId && f.status === "uploading" ? { ...f, status: "pausing" } : f))
     );
   };
 
   const handleStopUpload = (fileId: string) => {
-    const file = uploadFiles.find((f) => f.id === fileId);
-    if (!file || !file.abortController) return;
-    file.abortController.abort();
     setUploadFiles((prev) =>
       prev.map((f) =>
-        f.id === fileId
-          ? { ...f, status: "stopped", progress: 0, uploadedBytes: 0, pausedAtChunk: 0 }
+        f.id === fileId && f.status !== "completed"
+          ? { ...f, status: "stopped" }
           : f
       )
     );
   };
 
-  async function handleDone() {
-    const pendingFiles = uploadFiles.filter(
-      (f) => f.status === "pending" || f.status === "paused"
+  async function handleDone(fileId?: string) {
+    if (workerActive.current || filesRef.current.some((f) => f.status === "preparing")) return;
+    const pendingFiles = filesRef.current.filter(
+      (f) => (!fileId || f.id === fileId) && (f.status === "pending" || f.status === "paused")
     );
     if (pendingFiles.length === 0) return;
 
-    const token = localStorage.getItem("vaultx_access_token");
-    const masterKey_b64 = sessionStorage.getItem("vaultx_master_key");
+    const token = memorySession.getItem("vaultx_access_token");
+    const masterKey_b64 = memorySession.getItem("vaultx_master_key");
     if (!token || !masterKey_b64) {
-      alert("Missing keys or token. Please log in again.");
+      setQueueError("Missing keys or token. Please log in again.");
       return;
     }
 
+    workerActive.current = true;
     setIsUploading(true);
+    let activeFileId: string | undefined;
     try {
       const keywordChains: Record<string, string> = JSON.parse(
-        sessionStorage.getItem("vaultx_keyword_chain") || "{}"
+        memorySession.getItem("vaultx_keyword_chain") || "{}"
       );
 
       const masterKeyBytes = Uint8Array.from(atob(masterKey_b64), (c) =>
         c.charCodeAt(0)
       );
-      const masterKey = await crypto.subtle.importKey(
-        "raw",
-        masterKeyBytes,
-        { name: "AES-GCM" },
-        false,
-        ["encrypt"]
-      );
+      let masterKey: CryptoKey;
+      try {
+        masterKey = await crypto.subtle.importKey(
+          "raw",
+          masterKeyBytes,
+          { name: "AES-GCM" },
+          false,
+          ["encrypt"]
+        );
+      } finally {
+        // Best effort for this owned buffer; JS strings/runtime copies remain.
+        masterKeyBytes.fill(0);
+      }
 
       for (const item of pendingFiles) {
-        if (item.status === "stopped") continue;
+        const current = filesRef.current.find((f) => f.id === item.id);
+        if (!current || current.status === "stopped") continue;
+        activeFileId = current.id;
 
-        await uploadSingleFile(item, token, masterKey_b64, masterKey, keywordChains);
-
-        if (item.abortController?.signal.aborted && item.status !== "completed") {
-          break;
-        }
+        const completed = await uploadSingleFile(current, token, masterKey_b64, masterKey, keywordChains);
+        if (!completed) break;
       }
 
-      if (uploadFiles.every((f) => f.status === "completed")) {
-        const chainJson = JSON.stringify(keywordChains);
-        const encChain = await encryptStringWithAes(chainJson, masterKey_b64);
-        await api.post(
-          "/user/index_state",
-          {
-            index_state_ciphertext: encChain.ciphertext_b64,
-            index_state_iv: encChain.iv_b64,
-          },
-          token
-        );
-        sessionStorage.setItem("vaultx_keyword_chain", JSON.stringify(keywordChains));
-
-        onUploadSuccess?.();
-        window.location.reload();
-      }
     } catch (err) {
       const msg = errorMessage(err, "Upload failed");
       setUploadFiles((prev) =>
-        prev.map((f) => ({
+        prev.map((f) => f.id === activeFileId && f.status !== "stopped" ? ({
           ...f,
           status: "error" as const,
           errorMessage: msg,
-        }))
+        }) : f)
       );
-      alert(msg);
+      setQueueError(msg);
     } finally {
+      workerActive.current = false;
       setIsUploading(false);
     }
   }
@@ -371,24 +377,29 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
     token: string,
     masterKey_b64: string,
     masterKey: CryptoKey,
-    keywordChains: Record<string, string>
+    persistedChains: Record<string, string>
   ) {
-    const controller = new AbortController();
+    clocks.current[item.id] = { started: performance.now(), elapsed: item.activeMs ?? 0 };
+    const elapsed = () => {
+      const clock = clocks.current[item.id];
+      return clock.elapsed + performance.now() - clock.started;
+    };
+    const keywordChains: Record<string, string> = Object.assign(Object.create(null), persistedChains, item.keywordChains);
+    const stopAtBoundary = () => {
+      const status = filesRef.current.find((f) => f.id === item.id)?.status;
+      if (status === "pausing") {
+        setUploadFiles((prev) => prev.map((f) => f.id === item.id ? { ...f, status: "paused", activeMs: elapsed() } : f));
+      }
+      return status === "pausing" || status === "stopped" || !status;
+    };
 
     setUploadFiles((prev) =>
       prev.map((f) =>
         f.id === item.id
-          ? { ...f, status: "uploading", abortController: controller }
+          ? { ...f, status: "uploading" }
           : f
       )
     );
-
-    if (controller.signal.aborted) {
-      setUploadFiles((prev) =>
-        prev.map((f) => (f.id === item.id ? { ...f, status: "paused" } : f))
-      );
-      return;
-    }
 
     // Encryption state resolves into LOCALS: React state snapshots held by
     // this closure can be stale, and the file IV must never fall back to a
@@ -403,37 +414,41 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
     if (!fileKey_b64 || !metadataEnc || !kfEnc) {
       fileKey_b64 = await generateFileKey();
       const fileKeyBytes = Uint8Array.from(atob(fileKey_b64), (c) => c.charCodeAt(0));
-      const fileKey = await crypto.subtle.importKey(
-        "raw",
-        fileKeyBytes,
-        { name: "AES-GCM" },
-        false,
-        ["encrypt"]
-      );
+      try {
+        const fileKey = await crypto.subtle.importKey(
+          "raw",
+          fileKeyBytes,
+          { name: "AES-GCM" },
+          false,
+          ["encrypt"]
+        );
 
-      const metadata = JSON.stringify({
-        name: item.file.name,
-        size: item.file.size,
-        type: item.file.type,
-        chunk_size: CHUNK_SIZE,
-        keywords: [
-          ...new Set([
-            ...globalKeywords,
-            ...(item.selectedKeywords?.length
-              ? item.selectedKeywords
-              : item.autoKeywords || []),
-          ]),
-        ],
-      });
+        const metadata = JSON.stringify({
+          name: item.file.name,
+          size: item.file.size,
+          type: item.file.type,
+          chunk_size: CHUNK_SIZE,
+          keywords: [
+            ...new Set([
+              ...globalKeywords,
+              ...(item.selectedKeywords?.length
+                ? item.selectedKeywords
+                : item.autoKeywords || []),
+            ]),
+          ],
+        });
 
-      metadataEnc = await aesEncryptArrayBuffer(
-        new TextEncoder().encode(metadata).buffer,
-        fileKey
-      );
+        metadataEnc = await aesEncryptArrayBuffer(
+          new TextEncoder().encode(metadata).buffer,
+          fileKey
+        );
 
-      kfEnc = await aesEncryptArrayBuffer(fileKeyBytes.buffer, masterKey);
+        kfEnc = await aesEncryptArrayBuffer(fileKeyBytes.buffer, masterKey);
+      } finally {
+        fileKeyBytes.fill(0);
+      }
 
-      const searchKey_b64 = sessionStorage.getItem("vaultx_search_key");
+      const searchKey_b64 = memorySession.getItem("vaultx_search_key");
       if (!searchKey_b64) {
         throw new Error("Missing search key. Please log in again.");
       }
@@ -449,7 +464,7 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
       ];
 
       const tokens = allKeywords.map((kw) => {
-        const tokenBytes = genRandomBytes(16);
+        const tokenBytes = genRandomBytes(32);
         const prev_token = keywordChains[kw] || null;
         const obj = {
           token: bufToB64(tokenBytes.buffer as ArrayBuffer),
@@ -472,7 +487,7 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
 
       setUploadFiles((prev) =>
         prev.map((f) =>
-          f.id === item.id
+          f.id === item.id && f.status !== "stopped"
             ? {
                 ...f,
                 fileKey_b64,
@@ -486,20 +501,7 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
         )
       );
 
-      if (controller.signal.aborted) {
-        setUploadFiles((prev) =>
-          prev.map((f) => (f.id === item.id ? { ...f, status: "paused" } : f))
-        );
-        return;
-      }
-    }
-
-    if (fileKey_b64 && !fileEncIv) {
-      // Partial state from an older run: keep the keys, mint the nonce.
-      fileEncIv = bufToB64(genRandomBytes(12).buffer as ArrayBuffer);
-      setUploadFiles((prev) =>
-        prev.map((f) => (f.id === item.id ? { ...f, fileEncIv } : f))
-      );
+      if (stopAtBoundary()) return false;
     }
 
     if (!fileKey_b64 || !metadataEnc || !kfEnc || !tokens_json || !fileEncIv) {
@@ -507,132 +509,98 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
     }
 
     const totalSize = item.file.size;
-    let uploadedBytes = item.pausedAtChunk * CHUNK_SIZE;
+    let uploadedBytes = Math.min(item.pausedAtChunk * CHUNK_SIZE, totalSize);
     const totalChunks = Math.ceil(totalSize / CHUNK_SIZE) || 1;
     const fileNonce = Uint8Array.from(atob(fileEncIv), (c) => c.charCodeAt(0));
 
     for (let chunkIndex = item.pausedAtChunk; chunkIndex < totalChunks; chunkIndex++) {
-      if (controller.signal.aborted) {
-        setUploadFiles((prev) =>
-          prev.map((f) =>
-            f.id === item.id
-              ? { ...f, status: "paused", pausedAtChunk: chunkIndex, uploadedBytes }
-              : f
-          )
-        );
-        return;
-      }
+      if (stopAtBoundary()) return false;
 
       const start = chunkIndex * CHUNK_SIZE;
       const end = Math.min(start + CHUNK_SIZE, totalSize);
       const chunk = item.file.slice(start, end);
       const chunkBuffer = await chunk.arrayBuffer();
+      try {
+        const fileKeyBytes = Uint8Array.from(atob(fileKey_b64), (c) => c.charCodeAt(0));
+        let chunkKey: CryptoKey;
+        try {
+          chunkKey = await crypto.subtle.importKey(
+            "raw",
+            fileKeyBytes,
+            { name: "AES-GCM" },
+            false,
+            ["encrypt", "decrypt"]
+          );
+        } finally {
+          fileKeyBytes.fill(0);
+        }
 
-      const fileKeyBytes = Uint8Array.from(atob(fileKey_b64), (c) => c.charCodeAt(0));
-      const chunkKey = await crypto.subtle.importKey(
-        "raw",
-        fileKeyBytes,
-        { name: "AES-GCM" },
-        false,
-        ["encrypt", "decrypt"]
-      );
+        // Derive this chunk's IV from the persisted file nonce + chunk index.
+        const chunkIv = buildChunkIv(fileNonce, chunkIndex);
+        // FIX: Use the file IV for encryption instead of generating a new random one
+        const encryptedChunk = await aesEncryptArrayBuffer(chunkBuffer, chunkKey, chunkIv);
+        if (stopAtBoundary()) return false;
+        const chunkBytes = Uint8Array.from(atob(encryptedChunk.ciphertext_b64), (c) =>
+          c.charCodeAt(0)
+        );
 
-      // Derive this chunk's IV from the persisted file nonce + chunk index.
-      const chunkIv = buildChunkIv(fileNonce, chunkIndex);
-      // FIX: Use the file IV for encryption instead of generating a new random one
-      const encryptedChunk = await aesEncryptArrayBuffer(chunkBuffer, chunkKey, chunkIv);
-      const chunkBytes = Uint8Array.from(atob(encryptedChunk.ciphertext_b64), (c) =>
-        c.charCodeAt(0)
-      );
+        const formData = new FormData();
+        formData.append("file_id", item.id);
+        formData.append("metadata_ciphertext", metadataEnc.ciphertext_b64);
+        formData.append("metadata_iv", metadataEnc.iv_b64);
+        formData.append("encrypted_kf_b64", kfEnc.ciphertext_b64);
+        formData.append("encrypted_kf_iv", kfEnc.iv_b64);
+        formData.append("file_iv", fileEncIv);
+        formData.append("tokens_json", tokens_json);
+        formData.append("file", new Blob([chunkBytes.buffer]));
+        formData.append("chunk_index", String(chunkIndex));
+        formData.append("total_chunks", String(totalChunks));
+        formData.append("is_last_chunk", chunkIndex === totalChunks - 1 ? "true" : "false");
 
-      const formData = new FormData();
-      formData.append("file_id", item.id);
-      formData.append("metadata_ciphertext", metadataEnc.ciphertext_b64);
-      formData.append("metadata_iv", metadataEnc.iv_b64);
-      formData.append("encrypted_kf_b64", kfEnc.ciphertext_b64);
-      formData.append("encrypted_kf_iv", kfEnc.iv_b64);
-      formData.append("file_iv", fileEncIv);
-      formData.append("tokens_json", tokens_json);
-      formData.append("file", new Blob([chunkBytes.buffer]));
-      formData.append("chunk_index", String(chunkIndex));
-      formData.append("total_chunks", String(totalChunks));
-      formData.append("is_last_chunk", chunkIndex === totalChunks - 1 ? "true" : "false");
+        await api.post("/files/upload", formData, token, false);
 
-      await api.post("/files/upload", formData, token, false);
-
-      uploadedBytes = end;
-      const percent = Math.round((uploadedBytes / totalSize) * 100);
-      setUploadFiles((prev) =>
-        prev.map((f) =>
-          f.id === item.id
-            ? { ...f, progress: percent, uploadedBytes, pausedAtChunk: chunkIndex + 1 }
-            : f
-        )
-      );
+        uploadedBytes = end;
+        const percent = totalSize === 0 ? 100 : (uploadedBytes / totalSize) * 100;
+        setUploadFiles((prev) =>
+          prev.map((f) =>
+            f.id === item.id && f.status !== "stopped"
+              ? { ...f, progress: percent, uploadedBytes, pausedAtChunk: chunkIndex + 1, activeMs: elapsed() }
+              : f
+          )
+        );
+      } finally {
+        // Only the owned plaintext chunk can be overwritten, not runtime copies.
+        new Uint8Array(chunkBuffer).fill(0);
+      }
     }
 
+    // Acknowledgement of the final chunk commits the file on the server.
+    // Finish its search head even if stop/pause arrived during that request.
+    // Persist the search head after each completed file, using actual async
+    // completion rather than the stale React snapshot captured by the caller.
+    const chainJson = JSON.stringify(keywordChains);
+    const encChain = await encryptStringWithAes(chainJson, masterKey_b64);
+    await api.post("/user/index_state", {
+      index_state_ciphertext: encChain.ciphertext_b64,
+      index_state_iv: encChain.iv_b64,
+    }, token);
+    Object.assign(persistedChains, keywordChains);
+    memorySession.setItem("vaultx_keyword_chain", chainJson);
+    memorySession.setItem(`vaultx_kf_${item.id}`, fileKey_b64);
+    const wasAborted = filesRef.current.find((f) => f.id === item.id)?.status === "stopped";
     setUploadFiles((prev) =>
       prev.map((f) =>
-        f.id === item.id ? { ...f, status: "completed", progress: 100 } : f
+        f.id === item.id && f.status !== "stopped" ? { ...f, status: "completed", progress: 100, uploadedBytes: totalSize, activeMs: elapsed() } : f
       )
     );
+    onUploadSuccess?.();
+    return !wasAborted;
   }
 
   const handleResumeUpload = async (fileId: string) => {
-    const file = uploadFiles.find((f) => f.id === fileId);
+    const file = filesRef.current.find((f) => f.id === fileId);
     if (!file || file.status !== "paused") return;
-
-    const token = localStorage.getItem("vaultx_access_token");
-    const masterKey_b64 = sessionStorage.getItem("vaultx_master_key");
-    if (!token || !masterKey_b64) return;
-
-    const masterKeyBytes = Uint8Array.from(atob(masterKey_b64), (c) => c.charCodeAt(0));
-    const masterKey = await crypto.subtle.importKey(
-      "raw",
-      masterKeyBytes,
-      { name: "AES-GCM" },
-      false,
-      ["encrypt"]
-    );
-
-    const keywordChains: Record<string, string> = JSON.parse(
-      sessionStorage.getItem("vaultx_keyword_chain") || "{}"
-    );
-
-    setUploadFiles((prev) =>
-      prev.map((f) => (f.id === fileId ? { ...f, status: "uploading", pausedAtChunk: 0, uploadedBytes: 0 } : f))
-    );
-
-    setIsUploading(true);
-    try {
-      await uploadSingleFile(file, token, masterKey_b64, masterKey, keywordChains);
-
-      if (uploadFiles.every((f) => f.status === "completed")) {
-        const chainJson = JSON.stringify(keywordChains);
-        const encChain = await encryptStringWithAes(chainJson, masterKey_b64);
-        await api.post(
-          "/user/index_state",
-          {
-            index_state_ciphertext: encChain.ciphertext_b64,
-            index_state_iv: encChain.iv_b64,
-          },
-          token
-        );
-        sessionStorage.setItem("vaultx_keyword_chain", JSON.stringify(keywordChains));
-        onUploadSuccess?.();
-        window.location.reload();
-      }
-    } catch (err) {
-      const msg = errorMessage(err, "Upload failed");
-      setUploadFiles((prev) =>
-        prev.map((f) =>
-          f.id === fileId ? { ...f, status: "error", errorMessage: msg } : f
-        )
-      );
-      alert(msg);
-    } finally {
-      setIsUploading(false);
-    }
+    await handleDone(fileId);
   };
 
   const removeFile = (id: string) =>
@@ -642,14 +610,14 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
     (f) => f.status === "completed"
   ).length;
   const pendingCount = uploadFiles.filter(
-    (f) => f.status === "pending" || f.status === "uploading" || f.status === "paused"
+      (f) => f.status === "pending" || f.status === "uploading" || f.status === "pausing" || f.status === "paused"
   ).length;
   const errorCount = uploadFiles.filter((f) => f.status === "error").length;
 
   const statusIcon = (s: UploadFile["status"]) =>
     s === "completed" ? (
       <CheckCircle className="w-4 h-4 text-success" />
-    ) : s === "uploading" ? (
+    ) : s === "uploading" || s === "pausing" || s === "preparing" ? (
       <span className="w-4 h-4 animate-spin border-2 border-primary border-t-transparent rounded-full" />
     ) : s === "paused" ? (
       <Pause className="w-4 h-4 text-warning" />
@@ -663,17 +631,18 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
 
   return (
     <Dialog open={open} onOpenChange={closeModal}>
-      <DialogContent className="max-w-2xl max-h-[80vh] flex flex-col border-border shadow-xl">
+      <DialogContent className="max-w-3xl max-h-[90dvh] flex flex-col overflow-y-auto border border-border shadow-none">
         <DialogHeader>
           <DialogTitle>Upload Files</DialogTitle>
           <DialogDescription className="text-sm text-muted-foreground">
             Files are encrypted client-side before leaving your device.
+            {" "}Files upload sequentially. Pause waits for the current chunk request and holds the queue. Abort does not undo chunks already sent;
+            a final chunk already in flight may complete the file.
           </DialogDescription>
         </DialogHeader>
 
         <div
-          ref={dropZoneRef}
-          className="flex flex-col items-center justify-center rounded-lg border border-dashed border-border bg-muted/30 px-6 py-8 text-center transition-colors dropzone-inactive"
+          className={`flex flex-col items-center justify-center rounded-lg border border-dashed px-6 py-6 text-center transition-colors duration-200 ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none ${dragActive ? "border-primary bg-primary/10" : "border-border bg-muted/30"}`}
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
@@ -683,20 +652,20 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
             Drag & drop files here, or select files
           </p>
           <p className="text-xs text-muted-foreground mb-4">
-            Supports PDF, documents, images, spreadsheets and archives
+            Any file type · Configured upload limit unavailable
           </p>
-          <Button variant="outline" size="sm" asChild>
-            <label className="cursor-pointer">
+          <Button variant="outline" className="min-h-11" disabled={isUploading} onClick={() => fileInputRef.current?.click()}>
               Select files
+          </Button>
               <input
+                ref={fileInputRef}
+                aria-label="Select files to upload"
                 type="file"
                 multiple
                 className="hidden"
                 onChange={handleFileSelect}
                 disabled={isUploading}
               />
-            </label>
-          </Button>
         </div>
 
         <div className="mb-4">
@@ -715,13 +684,14 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
               onChange={(e) => setCurrentKeyword(e.target.value)}
               onKeyDown={handleKeyPress}
               placeholder="Add a keyword and press Enter"
-              className="h-9 border-border focus:border-ring"
+              className="min-h-11 border-border focus:border-ring"
               disabled={isUploading}
             />
             <Button
               type="button"
               size="sm"
               variant="ghost"
+              className="min-h-11"
               onClick={handleAddKeyword}
               disabled={!currentKeyword.trim() || isUploading}
             >
@@ -739,7 +709,7 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
                 <button
                   type="button"
                   onClick={() => handleRemoveKeyword(kw)}
-                  className="ml-1.5 rounded-full p-0.5 hover:bg-muted cursor-pointer"
+                  className="ml-1.5 min-h-11 min-w-11 inline-flex items-center justify-center rounded hover:bg-muted cursor-pointer"
                   aria-label={`Remove keyword ${kw}`}
                   disabled={isUploading}
                 >
@@ -750,18 +720,20 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
           </div>
         </div>
 
+        {queueError && <p role="alert" className="text-sm text-destructive">{queueError}</p>}
+        {uploadFiles.length === 0 && <p className="text-sm text-muted-foreground">Your upload queue is empty. Select files to prepare encrypted uploads.</p>}
         {uploadFiles.length > 0 && (
           <div className="space-y-4 overflow-y-auto flex-1">
             {uploadFiles.map((f) => (
               <div
                 key={f.id}
-                className="flex items-start gap-3 rounded-lg border border-border bg-muted/20 p-3"
+                className="flex flex-wrap items-start gap-3 rounded-lg border border-border bg-muted/20 p-3"
               >
                 <div className="flex items-center justify-center w-10 h-10 rounded bg-muted/60 shrink-0">
                   {statusIcon(f.status)}
                 </div>
 
-                <div className="flex-1 min-w-0">
+                <div className="flex-1 min-w-0 basis-[70%]">
                   <div className="flex items-center justify-between">
                     <p className="text-sm font-medium text-foreground truncate">
                       {f.file.name}
@@ -771,29 +743,18 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
                     </span>
                   </div>
 
-                  {f.status === "uploading" && (
-                    <div className="mt-2">
-                      <Progress value={f.progress} className="h-1.5" />
-                      <div className="flex justify-between mt-1 text-xs text-muted-foreground">
-                        <span>{formatSize(f.uploadedBytes)}</span>
-                        <span>{f.progress}%</span>
-                      </div>
-                    </div>
-                  )}
-
-                  {f.status === "paused" && (
-                    <div className="mt-2">
-                      <Progress value={f.progress} className="h-1.5" />
-                      <div className="flex justify-between mt-1 text-xs text-muted-foreground">
-                        <span>{formatSize(f.uploadedBytes)} / {formatSize(f.file.size)}</span>
-                        <span>Paused at {f.progress}%</span>
-                      </div>
-                    </div>
-                  )}
+                  <p role="status" className="my-2 text-xs text-muted-foreground">{f.status === "preparing" ? "Preparing keywords locally…" : f.status === "pausing" ? "Pausing at chunk boundary…" : f.status === "pending" ? "Queued" : f.status}</p>
+                  <TransferStats bytes={f.uploadedBytes} total={f.file.size} activeMs={f.activeMs ?? 0} complete={f.status === "completed"} paused={f.status === "paused"} />
 
                   {f.status === "error" && f.errorMessage && (
                     <p className="mt-1 text-xs text-destructive">
                       {f.errorMessage}
+                    </p>
+                  )}
+
+                  {f.status === "stopped" && (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Stopped locally. Requests already sent may still finish.
                     </p>
                   )}
 
@@ -806,6 +767,7 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
                   {(f.autoKeywords?.length || 0) > 0 &&
                     f.status !== "completed" &&
                     f.status !== "uploading" &&
+                    f.status !== "pausing" &&
                     f.status !== "paused" && (
                       <div className="mt-2 flex flex-wrap gap-1.5">
                         {(f.autoKeywords || []).map((kw) => {
@@ -816,7 +778,7 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
                               type="button"
                               onClick={() => handleToggleKeyword(f.id, kw)}
                               className={
-                                "cursor-pointer px-2 py-1 rounded text-xs " +
+                                "cursor-pointer min-h-11 px-3 py-1 rounded text-xs " +
                                 (selected
                                   ? "bg-primary/10 text-primary"
                                   : "bg-muted/60 text-muted-foreground hover:bg-muted")
@@ -834,11 +796,12 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
                   <Button
                     variant="ghost"
                     size="sm"
-                    className="h-6 w-6 p-0 hover:bg-warning/10 hover:text-warning"
+                    className="min-h-11 px-3"
                     onClick={() => handlePauseUpload(f.id)}
                     aria-label={`Pause ${f.file.name}`}
                   >
                     <Pause className="w-3.5 h-3.5" />
+                    Pause
                   </Button>
                 )}
 
@@ -846,23 +809,26 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
                   <Button
                     variant="ghost"
                     size="sm"
-                    className="h-6 w-6 p-0 hover:bg-primary/10 hover:text-primary"
+                    className="min-h-11 px-3"
                     onClick={() => handleResumeUpload(f.id)}
+                    disabled={isUploading}
                     aria-label={`Resume ${f.file.name}`}
                   >
                     <Play className="w-3.5 h-3.5" />
+                    Resume
                   </Button>
                 )}
 
-                {f.status !== "uploading" && f.status !== "completed" && (
+                {f.status !== "stopped" && f.status !== "completed" && (
                   <Button
                     variant="ghost"
                     size="sm"
-                    className="h-6 w-6 p-0 hover:bg-destructive/10 hover:text-destructive"
+                    className="min-h-11 px-3 text-destructive"
                     onClick={() => handleStopUpload(f.id)}
-                    aria-label={`Cancel ${f.file.name}`}
+                    aria-label={`Abort ${f.file.name}`}
                   >
                     <Square className="w-3.5 h-3.5" />
+                    Abort
                   </Button>
                 )}
 
@@ -870,7 +836,7 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
                     <Button
                       variant="ghost"
                       size="sm"
-                      className="h-6 w-6 p-0 hover:bg-muted cursor-pointer"
+                      className="min-h-11 min-w-11 p-0 hover:bg-muted cursor-pointer"
                       onClick={() => removeFile(f.id)}
                       disabled={isUploading}
                       aria-label={`Remove ${f.file.name}`}
@@ -883,7 +849,8 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
           </div>
         )}
 
-        <div className="flex items-center justify-between pt-4 border-t border-border">
+        <p className="text-xs text-muted-foreground">Statistics use acknowledged plaintext bytes and active processing time, excluding pauses. Updates arrive at chunk boundaries.</p>
+        <div className="flex flex-wrap gap-3 items-center justify-between pt-4 border-t border-border">
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             {isUploading ? (
               <>
@@ -913,16 +880,18 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess }: UploadModal
               variant="outline"
               size="sm"
               onClick={() => closeModal(false)}
+              className="min-h-11"
               disabled={isUploading}
             >
-              Cancel
+              Close
             </Button>
             <Button
               size="sm"
-              onClick={handleDone}
-              disabled={isUploading || uploadFiles.length === 0}
+              onClick={() => handleDone()}
+              className="min-h-11"
+              disabled={isUploading || uploadFiles.some((f) => f.status === "preparing") || !uploadFiles.some((f) => f.status === "pending" || f.status === "paused")}
             >
-              {isUploading ? "Uploading…" : "Done"}
+              {isUploading ? "Uploading…" : "Start / resume queue"}
             </Button>
           </div>
         </div>

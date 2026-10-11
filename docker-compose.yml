@@ -5,14 +5,12 @@ services:
     restart: always
     environment:
       POSTGRES_USER: vaultx_user
-      POSTGRES_PASSWORD: vaultx_pass
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
       POSTGRES_DB: vaultx
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - vaultx_net
-    ports:
-      - "5432"
 
   backend:
     build: ./backend
@@ -29,7 +27,7 @@ services:
       DB_PORT: 5432
       DB_NAME: vaultx
       DB_USER: vaultx_user
-      DB_PASSWORD: vaultx_pass
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
       MAIL_HOST: smtp.gmail.com
       MAIL_PORT: 587
       MAIL_USERNAME: noreply
@@ -46,10 +44,9 @@ services:
       - db
     networks:
       - vaultx_net
-    ports:
-      - "8000"
     volumes:
-      - ./backend:/app
+      - vaultx_keys:/etc/vaultx/keys
+      - vaultx_storage:/var/vaultx/storage
 
   frontend:
     build:
@@ -73,3 +70,5 @@ networks:
 
 volumes:
   postgres_data:
+  vaultx_keys:
+  vaultx_storage:

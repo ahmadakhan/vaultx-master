@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useState } from "react"
+import React, { useRef, useState } from "react"
 import { useRouter } from "next/navigation"
 import { Eye, EyeOff, Lock, Mail, AlertCircle, Shield } from "lucide-react"
 import { Button } from "@/components/ui/button"
@@ -15,10 +15,11 @@ import {
 } from "@/components/ui/card"
 import Link from "next/link"
 import { api } from "@/lib/api"
-import { deriveMasterKey } from "@/lib/crypto/keys"
-import { aesDecryptArrayBuffer, decryptStringWithAes } from "@/lib/crypto/aes"
+import { decryptStringWithAes } from "@/lib/crypto/aes"
+import { unlockUserKeyBundle, type UserKeyBundle } from "@/lib/crypto/bundle"
 import { prepareUserKeyBundle } from "@/lib/crypto/setupUserKeys"
-import { setVaultXContext } from "@/lib/crypto/context"
+import { clearVaultXContext, memorySession, setVaultXContext } from "@/lib/crypto/context"
+import { OtpDeck } from "@/components/otp-deck"
 
 export function LoginForm() {
   const [mode, setMode] = useState<"login" | "register">("login")
@@ -32,11 +33,14 @@ export function LoginForm() {
   const [error, setError] = useState<string | null>(null)
   const [showPassword, setShowPassword] = useState(false)
   const router = useRouter()
+  const requestBusy = useRef(false)
 
   const clearError = () => setError(null)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (requestBusy.current) return
+    requestBusy.current = true
     setLoading(true)
     clearError()
 
@@ -76,6 +80,7 @@ export function LoginForm() {
           : "Something went wrong. Please try again."
       )
     } finally {
+      requestBusy.current = false
       setLoading(false)
     }
   }
@@ -100,25 +105,26 @@ export function LoginForm() {
     }
   }
 
-  async function handleMfaSubmit(e: React.FormEvent) {
-    e.preventDefault()
+  async function handleMfaSubmit(code: string) {
+    if (requestBusy.current) return
+    requestBusy.current = true
     setLoading(true)
     clearError()
 
     try {
-      if (!mfaCode || mfaCode.length !== 6) {
+      if (!/^\d{6}$/.test(code)) {
         setError("Please enter the 6-digit code from your authenticator app.")
         setLoading(false)
         return
       }
 
-      const res = await api.post("/auth/mfa/verify", { code: mfaCode }, mfaToken || undefined)
+      const res = await api.post("/auth/mfa/verify", { code }, mfaToken || undefined)
       const data = res.data || res
 
       const accessToken = data.access_token
       if (!accessToken) throw new Error("No access token returned")
       // The key bundle is only released after the second factor is proven;
-      // unlock it now and populate both storage and the in-memory context.
+       // unlock it now and populate the memory-only context.
       const keys = data.keys
       if (!keys) throw new Error("The server returned no vault keys. Please log in again.")
       await activateSession(accessToken, keys, password, email)
@@ -131,69 +137,36 @@ export function LoginForm() {
           : "Something went wrong. Please try again."
       )
     } finally {
+      requestBusy.current = false
       setLoading(false)
     }
   }
 
-  async function decryptToB64(ciphertext: string, iv: string, pwKey: CryptoKey) {
-    const raw = await aesDecryptArrayBuffer(ciphertext, iv, pwKey)
-    return btoa(String.fromCharCode(...new Uint8Array(raw)))
-  }
-
   /**
-   * Unwrap the vault key bundle with the password-derived key, persist the
-   * session (localStorage token + sessionStorage keys) and populate the
+   * Unwrap the vault key bundle with the password-derived key and populate the
    * in-memory VaultXContext that every authenticated screen reads.
    * Used by both the plain login and the post-MFA verification path.
    */
   async function activateSession(
     accessToken: string,
-    keys: {
-      password_salt_b64: string
-      enc_master_key_b64: string
-      enc_master_key_iv: string
-      enc_search_key_b64: string
-      enc_search_key_iv: string
-      enc_private_key_b64: string
-      enc_private_key_iv: string
-      public_key_b64: string
-    },
+    keys: UserKeyBundle,
     password: string,
     email: string
   ) {
-    const { key: pwKey } = await deriveMasterKey(password, keys.password_salt_b64)
-
-    const masterKey_b64 = await decryptToB64(
-      keys.enc_master_key_b64,
-      keys.enc_master_key_iv,
-      pwKey
-    )
-    const searchKey_b64 = await decryptToB64(
-      keys.enc_search_key_b64,
-      keys.enc_search_key_iv,
-      pwKey
-    )
-    const privateKey_b64 = await decryptToB64(
-      keys.enc_private_key_b64,
-      keys.enc_private_key_iv,
-      pwKey
-    )
-
-    localStorage.setItem("vaultx_access_token", accessToken)
-    sessionStorage.setItem("vaultx_master_key", masterKey_b64)
-    sessionStorage.setItem("vaultx_search_key", searchKey_b64)
-    sessionStorage.setItem("vaultx_private_key", privateKey_b64)
-    sessionStorage.setItem("vaultx_public_key", keys.public_key_b64)
-    sessionStorage.setItem("vaultx_user_email", email)
+    clearVaultXContext()
+    if (!keys?.password_salt_b64) throw new Error("The server returned no vault keys. Please log in again.")
+    const { masterKey_b64, searchKey_b64, privateKey_b64 } = await unlockUserKeyBundle(password, keys)
 
     const chainData = await api.get("/user/index_state", accessToken)
+    let keywordChain = "{}"
     if (chainData?.index_state_ciphertext) {
       const chainJson = await decryptStringWithAes(
         chainData.index_state_ciphertext,
         chainData.index_state_iv,
         masterKey_b64
       )
-      sessionStorage.setItem("vaultx_keyword_chain", chainJson)
+      JSON.parse(chainJson)
+      keywordChain = chainJson
     }
 
     setVaultXContext({
@@ -202,16 +175,25 @@ export function LoginForm() {
       searchKey_b64,
       privateKey_b64,
       publicKey_b64: keys.public_key_b64,
+      email,
     })
+    memorySession.setItem("vaultx_keyword_chain", keywordChain)
+    setPassword("")
+    setConfirmPassword("")
+    setMfaToken(null)
   }
 
   const toggleMode = () => {
+    if (requestBusy.current) return
+    setShowMfa(false)
+    setMfaToken(null)
+    setMfaCode("")
     setMode(mode === "login" ? "register" : "login")
     clearError()
   }
 
   return (
-    <Card className="w-full max-w-md mx-auto border-border shadow-xl">
+    <Card className="w-full max-w-md mx-auto border-border shadow-none">
       <CardHeader className="space-y-5 text-center pb-4">
         <div className="flex items-center justify-center space-x-2">
           <div className="w-9 h-9 rounded-lg bg-primary flex items-center justify-center">
@@ -227,60 +209,28 @@ export function LoginForm() {
           </CardTitle>
           <CardDescription className="text-sm text-muted-foreground mt-1">
             {mode === "login"
-              ? "Enter your credentials to access your encrypted vault."
+              ? "Enter your credentials to unlock your vault. Reloading the page locks it again."
               : "Join VaultX — your data, encrypted end-to-end."}
           </CardDescription>
         </div>
       </CardHeader>
 
       <CardContent className="space-y-5">
-        {error && (
-          <div className="flex items-start gap-2.5 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+        {error && !showMfa && (
+          <div role="alert" className="flex items-start gap-2.5 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
             <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
             <span>{error}</span>
           </div>
         )}
 
            {showMfa ? (
-             <form onSubmit={handleMfaSubmit} className="space-y-4">
+             <div className="space-y-4">
                <div className="flex items-center justify-center pb-2">
                  <Shield className="w-8 h-8 text-primary" strokeWidth={1.5} />
                </div>
-               <div className="space-y-2">
-                 <Label htmlFor="mfa-code" className="vaultx-label text-xs">
-                   2FA Code
-                 </Label>
-                 <div className="relative">
-                   <Shield
-                     className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground"
-                     strokeWidth={1.5}
-                   />
-                   <Input
-                     id="mfa-code"
-                     type="text"
-                     inputMode="numeric"
-                     placeholder="6-digit code from authenticator"
-                     maxLength={6}
-                     value={mfaCode}
-                     onChange={(e) => {
-                       setMfaCode(e.target.value.replace(/\D/g, "").slice(0, 6))
-                       clearError()
-                     }}
-                     onFocus={clearError}
-                     className="h-10 pl-10 border-border focus:border-ring focus:ring-ring/50"
-                     required
-                   />
-                 </div>
-               </div>
-
-               <Button
-                 type="submit"
-                 disabled={loading}
-                 className="w-full bg-primary hover:bg-primary/90 text-primary-foreground h-11"
-               >
-                 {loading ? "Verifying…" : "Verify & Sign In"}
-               </Button>
-             </form>
+               <OtpDeck value={mfaCode} onChange={(code) => { setMfaCode(code); clearError() }}
+                 onVerify={handleMfaSubmit} busy={loading} error={error} autoFocus actionLabel="Verify & Sign In" />
+             </div>
            ) : (
              <form onSubmit={handleSubmit} className="space-y-4">
                <div className="space-y-2">
@@ -303,7 +253,7 @@ export function LoginForm() {
                        clearError()
                      }}
                      onFocus={clearError}
-                     className="h-10 pl-10 border-border focus:border-ring focus:ring-ring/50"
+                      className="h-11 pl-10 border-border focus:border-ring focus:ring-ring/50"
                      required
                    />
                  </div>
@@ -314,15 +264,6 @@ export function LoginForm() {
                    <Label htmlFor={mode === "login" ? "password" : "reg-password"} className="vaultx-label text-xs">
                      Password
                    </Label>
-                   <button
-                     type="button"
-                     tabIndex={-1}
-                     onClick={() => setShowPassword((v) => !v)}
-                     className="text-xs text-muted-foreground hover:text-foreground"
-                     aria-label={showPassword ? "Hide password" : "Show password"}
-                   >
-                     {showPassword ? "Hide" : "Show"}
-                   </button>
                  </div>
                  <div className="relative">
                    <Lock
@@ -340,15 +281,13 @@ export function LoginForm() {
                        clearError()
                      }}
                      onFocus={clearError}
-                     className="h-10 pl-10 border-border focus:border-ring focus:ring-ring/50"
+                      className="h-11 pl-10 pr-14 border-border focus:border-ring focus:ring-ring/50"
                      required
                    />
                    <button
                      type="button"
-                     tabIndex={-1}
-
-                     onClick={() => setShowPassword((v) => !v)}
-                     className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                      onClick={() => setShowPassword((v) => !v)}
+                      className="absolute right-0 top-1/2 flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"
                      aria-label={showPassword ? "Hide password" : "Show password"}
                    >
                      {showPassword ? (
@@ -377,7 +316,7 @@ export function LoginForm() {
                        autoComplete="new-password"
                        value={confirmPassword}
                        onChange={(e) => setConfirmPassword(e.target.value)}
-                       className="h-10 pl-10 border-border focus:border-ring focus:ring-ring/50"
+                        className="h-11 pl-10 border-border focus:border-ring focus:ring-ring/50"
                        required
                      />
                    </div>
@@ -407,7 +346,8 @@ export function LoginForm() {
               <button
                 type="button"
                 onClick={toggleMode}
-                className="font-medium text-primary hover:text-primary/90"
+                disabled={loading}
+                className="min-h-11 px-2 font-medium text-primary hover:text-primary/90"
               >
                 Register
               </button>
@@ -418,7 +358,8 @@ export function LoginForm() {
               <button
                 type="button"
                 onClick={toggleMode}
-                className="font-medium text-primary hover:text-primary/90"
+                disabled={loading}
+                className="min-h-11 px-2 font-medium text-primary hover:text-primary/90"
               >
                 Login
               </button>

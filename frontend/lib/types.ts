@@ -1,4 +1,6 @@
 export interface FileItem {
+  plaintextSize?: number;
+  chunkSize?: number;
   id: string
   name: string
   type: "file"

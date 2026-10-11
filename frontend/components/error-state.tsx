@@ -21,13 +21,14 @@ export function ErrorState({
 }: ErrorStateProps) {
   return (
     <div
+      role="alert"
       className={cn(
-        "flex flex-col items-center justify-center h-full px-6 text-center",
+        "flex flex-col items-center justify-center min-h-72 h-full px-6 py-12 text-center",
         className
       )}
     >
       <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-destructive/10 mb-4">
-        <AlertCircle className="w-6 h-6 text-destructive" strokeWidth={1.5} />
+        <AlertCircle aria-hidden="true" className="w-6 h-6 text-destructive" strokeWidth={1.5} />
       </div>
       <h3 className="vaultx-subheading mb-1">{title}</h3>
       <p className="vaultx-secondary max-w-sm mb-6">{message}</p>

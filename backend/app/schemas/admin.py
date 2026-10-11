@@ -7,7 +7,7 @@ log inspection endpoints accessible only to users with the admin role.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -30,7 +30,7 @@ class UserCreate(BaseModel):
 
     email: EmailStr
     password: str = Field(..., min_length=12, max_length=128)
-    role: str | None = Field(default=None, description="Optional role: 'admin' or 'user'")
+    role: Literal["admin", "user"] | None = None
 
 
 class AdminAuditLogRead(BaseModel):

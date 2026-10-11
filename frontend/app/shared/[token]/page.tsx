@@ -1,8 +1,8 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { Download, Shield, AlertCircle, Loader2, FileText, Check } from "lucide-react"
-import { useRouter } from "next/navigation"
+import { useParams, useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -37,8 +37,8 @@ interface DecryptedMetadata {
   chunk_size?: number
 }
 
-export default function SharedAccessPage({ params }: { params: { token: string } }) {
-  const { token } = params
+export default function SharedAccessPage() {
+  const { token } = useParams<{ token: string }>()
   const router = useRouter()
   const [metadata, setMetadata] = useState<FileMetadata | null>(null)
   const [accessCode, setAccessCode] = useState("")
@@ -51,9 +51,13 @@ export default function SharedAccessPage({ params }: { params: { token: string }
   const [progress, setProgress] = useState(0)
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null)
   const [accessGranted, setAccessGranted] = useState(false)
+  const fileKey = useRef<string | null>(null)
 
   useEffect(() => {
+    fileKey.current = null
+    setAccessGranted(false)
     loadMetadata()
+    return () => { fileKey.current = null }
   }, [token])
 
   const loadMetadata = async () => {
@@ -80,16 +84,19 @@ export default function SharedAccessPage({ params }: { params: { token: string }
       let kf_b64: string | null = null
 
       if (meta.encrypted_kf_b64 && meta.encrypted_kf_iv && meta.kf_salt) {
-        if (code) {
+        const fragment = new URLSearchParams(window.location.hash.slice(1))
+        const secret = fragment.get("key")
+        if (secret && b64ToBuf(secret).byteLength !== 32) throw new Error("Invalid link secret")
+        if (secret || code) {
           const kf_buf = await decryptWithPassphrase(
             meta.encrypted_kf_b64,
             meta.encrypted_kf_iv,
             meta.kf_salt,
-            code
+            secret || code!
           )
           kf_b64 = bufToB64(kf_buf)
         } else {
-          // Same derivation as the owner used when creating the link.
+          // Read-only legacy compatibility. New links always carry #key=.
           const tokenPass = shareLinkPassphrase(meta.id)
           const key = await deriveAesKeyFromPassphrase(tokenPass, meta.kf_salt)
           const kf_buf = await window.crypto.subtle.decrypt(
@@ -103,20 +110,20 @@ export default function SharedAccessPage({ params }: { params: { token: string }
 
       if (!kf_b64) throw new Error("Could not decrypt file key.")
 
-      sessionStorage.setItem(`vaultx_kf_${meta.id}`, kf_b64)
-
       const metadataJson = await decryptStringWithAes(
         meta.metadata_ciphertext,
         meta.metadata_iv,
         kf_b64
       )
       const parsed: DecryptedMetadata = JSON.parse(metadataJson)
+      fileKey.current = kf_b64
       setFileInfo(parsed)
       setAccessGranted(true)
       setShowCodeInput(false)
-    } catch (err) {
-      setError("Failed to decrypt file metadata. Check your access code.")
-      console.error(err)
+    } catch {
+      fileKey.current = null
+      setAccessGranted(false)
+      setError("Cannot unlock this file. Open the complete shared link (including #key=) and check your access code.")
     }
   }
 
@@ -146,7 +153,6 @@ export default function SharedAccessPage({ params }: { params: { token: string }
     setProgress(0)
 
     try {
-      const rangeParam = ""
       let received = 0
       const total = metadata.file_size || 0
       const chunks: Uint8Array[] = []
@@ -160,28 +166,11 @@ export default function SharedAccessPage({ params }: { params: { token: string }
 
       // Headers contain metadata
       const fileIv = response.headers.get("X-File-Iv")
-      const metadataCt = response.headers.get("X-Metadata-Ciphertext")
-      const metadataIv = response.headers.get("X-Metadata-Iv")
-      const encryptedKf = response.headers.get("X-Encrypted-Kf")
-      const encryptedKfIv = response.headers.get("X-Encrypted-Kf-Iv")
-      const kfSalt = response.headers.get("X-Kf-Salt")
-      const fileId = response.headers.get("X-File-Id") || metadata.id
-
-      // Get Kf — reuse the one we decrypted, or decrypt from headers
-      let kf_b64 = sessionStorage.getItem(`vaultx_kf_${fileId}`)
-
-      if (!kf_b64 && encryptedKf && encryptedKfIv && kfSalt) {
-        if (accessCode) {
-          const kf_buf = await decryptWithPassphrase(
-            encryptedKf, encryptedKfIv, kfSalt, accessCode
-          )
-          kf_b64 = bufToB64(kf_buf)
-        }
-      }
+      // Only the key that successfully authenticated the displayed metadata
+      // may decrypt this download; never substitute server-provided key data.
+      const kf_b64 = fileKey.current
 
       if (!kf_b64) throw new Error("Missing file encryption key")
-
-      sessionStorage.setItem(`vaultx_kf_${fileId}`, kf_b64)
 
       // Stream the ciphertext
       const reader = response.body!.getReader()
@@ -220,6 +209,7 @@ export default function SharedAccessPage({ params }: { params: { token: string }
         kf_key,
         fileIv || metadata.file_iv,
         fileInfo.chunk_size ?? CHUNK_SIZE,
+        fileInfo.size,
       )
 
       // Create download

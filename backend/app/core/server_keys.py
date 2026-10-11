@@ -11,6 +11,7 @@ singletons (``SERVER_PRIVATE_KEY``, ``SERVER_PUBLIC_KEY``).
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -60,9 +61,10 @@ def _ensure_writable_dir(primary: Path) -> Path:
     for candidate, label in ((primary, "primary"), (Path(settings.fallback_keys_dir), "fallback")):
         try:
             candidate.mkdir(parents=True, exist_ok=True)
-            probe = candidate / ".write_probe"
-            probe.write_bytes(b"")
-            probe.unlink()
+            # A fixed probe filename races across workers: one worker unlinks
+            # another's probe and may incorrectly fall back to a different key.
+            with tempfile.TemporaryFile(dir=candidate):
+                pass
         except OSError as exc:
             logger.warning(
                 "Key directory unusable",
@@ -193,6 +195,20 @@ def load_server_keys() -> tuple[rsa.RSAPrivateKey, rsa.RSAPublicKey]:
             exists on disk.
     """
     key_dir = _ensure_writable_dir(Path(settings.keys_dir))
+    # Serialize the complete check/create/load sequence. O_EXCL alone leaves a
+    # window where another worker observes only the private half of a new pair.
+    # Production runs on Linux; flock is released automatically on process exit.
+    import fcntl
+
+    fd = os.open(key_dir / ".signing-key.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return _load_keys_in_directory(key_dir)
+    finally:
+        os.close(fd)
+
+
+def _load_keys_in_directory(key_dir: Path) -> tuple[rsa.RSAPrivateKey, rsa.RSAPublicKey]:
     priv_path = key_dir / PRIVATE_KEY_FILENAME
     pub_path = key_dir / PUBLIC_KEY_FILENAME
 

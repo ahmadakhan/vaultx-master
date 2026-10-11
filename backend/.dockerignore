@@ -9,9 +9,14 @@ wheels/
 # Virtual environments
 .venv
 .venv/
-storage/
+/storage/
 __pycache__/
 
 # Env files
 .env*
 .secret/
+test_keys/
+test_storage/
+*.db
+.mypy_cache/
+.ruff_cache/

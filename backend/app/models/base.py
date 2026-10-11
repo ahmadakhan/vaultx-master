@@ -35,8 +35,9 @@ class Base(DeclarativeBase):
     """Declarative base with ``repr`` and dict utilities for all models."""
 
     def __repr__(self) -> str:
-        attrs = {c.name: getattr(self, c.name) for c in self.__table__.columns}
-        return f"<{self.__class__.__name__} {attrs}>"
+        # Model repr is frequently included in exception/log messages. Do not
+        # expose password hashes, key bundles, MFA secrets, or stored ciphertext.
+        return f"<{self.__class__.__name__}>"
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain dict representation of the model's columns."""
@@ -57,6 +58,7 @@ def create_engine(url: str, echo: bool = False) -> AsyncEngine:
     return create_async_engine(
         url,
         echo=echo,
+        hide_parameters=True,
         pool_size=20,
         max_overflow=10,
         pool_pre_ping=True,

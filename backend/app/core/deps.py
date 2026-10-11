@@ -11,7 +11,8 @@ user has the "admin" role.
 from __future__ import annotations
 
 import uuid
-from typing import Annotated
+from datetime import UTC, datetime
+from typing import Annotated, Any
 
 from fastapi import Depends
 from fastapi.security import OAuth2PasswordBearer
@@ -19,15 +20,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AuthenticationError, AuthorizationError
-from app.core.security import ACCESS_TOKEN_TYPE, decode_token
+from app.core.security import ACCESS_TOKEN_TYPE, decode_token, hash_token_identifier
 from app.db import get_db
-from app.models import User, UserRole
+from app.models import RefreshToken, User, UserRole
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
-
-# In-memory MFA verification cache (token jti -> expiry).
-# In production, use Redis with a TTL matching the access token lifetime.
-_mfa_verified_cache: dict[str, float] = {}
 
 
 async def get_current_user(
@@ -70,6 +67,17 @@ async def get_current_user(
     if not user or not user.is_active:
         raise AuthenticationError("Invalid or expired token")
 
+    session = await db.scalar(
+        select(RefreshToken).where(
+            RefreshToken.user_id == user.id,
+            RefreshToken.jti_hash == hash_token_identifier(payload["jti"]),
+        )
+    )
+    if session is None or not session.is_active:
+        raise AuthenticationError("Session has expired or been revoked")
+    if user.mfa_enabled and not valid_mfa_claim(payload):
+        raise AuthenticationError("MFA verification required")
+
     return user
 
 
@@ -96,6 +104,14 @@ CurrentUser = Annotated[User, Depends(get_current_user)]
 CurrentAdmin = Annotated[User, Depends(get_current_admin)]
 
 
+def valid_mfa_claim(payload: dict[str, Any], *, recent: bool = False) -> bool:
+    verified_at = payload.get("mfa_at")
+    if type(verified_at) not in (int, float):
+        return False
+    age = datetime.now(UTC).timestamp() - verified_at
+    return age >= 0 and (not recent or age <= 1800)
+
+
 async def get_current_user_mfa_verified(
     current_user: Annotated[User, Depends(get_current_user)],
     token: Annotated[str, Depends(oauth2_scheme)],
@@ -107,9 +123,8 @@ async def get_current_user_mfa_verified(
     during login). This should be used for sensitive operations such as
     file deletion, user deactivation, or audit log access.
 
-    The verification state is tracked in an in-memory cache keyed by the
-    token's ``jti`` (JWT ID). In a multi-worker deployment, replace this
-    with Redis.
+    The verification timestamp is signed into the token and preserved during
+    refresh, so workers agree and refresh cannot extend the assurance window.
 
     Raises:
         AuthenticationError: If MFA is enabled but not recently verified.
@@ -119,19 +134,9 @@ async def get_current_user_mfa_verified(
 
     try:
         payload = decode_token(token, expected_type=ACCESS_TOKEN_TYPE)
-    except Exception as exc:  # noqa: BLE001 — fail CLOSED on any decode error
+    except Exception as exc:
         raise AuthenticationError("MFA verification required for this action") from exc
-    jti = payload.get("jti")
-
-    import time
-
-    now = time.monotonic()
-    # Opportunistic pruning so the cache cannot grow without bound for the
-    # lifetime of a worker process.
-    for key in [k for k, exp in _mfa_verified_cache.items() if exp <= now]:
-        del _mfa_verified_cache[key]
-
-    if jti and _mfa_verified_cache.get(jti, 0) > now:
+    if valid_mfa_claim(payload, recent=True):
         return current_user
 
     raise AuthenticationError("MFA verification required for this action")

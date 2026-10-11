@@ -2,10 +2,11 @@
 
 import { useEffect, useState } from "react"
 import { useRouter } from "next/navigation"
+import { clearVaultXContext, getSessionContext } from "@/lib/crypto/context"
 
 /**
  * Custom hook for authentication logic.
- * - Checks if access token exists in localStorage
+ * - Checks the memory-only unlocked session; reloading requires login
  * - Redirects to "/" if not found
  * - Returns the token so components can use it
  */
@@ -16,9 +17,10 @@ export function useAuth() {
 
   useEffect(() => {
     // This runs only on the client side
-    const storedToken = localStorage.getItem("vaultx_access_token")
+    const storedToken = getSessionContext()?.accessToken
 
     if (!storedToken) {
+      clearVaultXContext()
       // No token → redirect to login
       router.replace("/")
     } else {

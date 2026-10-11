@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit_verify import verify_audit_chain
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user_mfa_verified as get_current_user
 from app.core.logging import get_logger
 from app.db import get_db
 from app.models import TamperLog, User

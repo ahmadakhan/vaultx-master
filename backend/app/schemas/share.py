@@ -6,7 +6,8 @@ revoking file shares between users and via shareable public links.
 
 from __future__ import annotations
 
-from datetime import datetime
+import base64
+from datetime import UTC, datetime
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
@@ -27,7 +28,7 @@ class FileShareCreate(BaseModel):
     file_id: UUID
     recipient_email: EmailStr
     wrapped_key_b64: str = Field(..., min_length=1, max_length=4096)
-    permissions: str = Field(default="read", pattern="^(read|write|admin)$")
+    permissions: str = Field(default="read", pattern="^read$")
 
     @field_validator("recipient_email")
     @classmethod
@@ -71,10 +72,35 @@ class SharedLinkCreate(BaseModel):
     file_id: UUID
     access_code: str | None = Field(default=None, min_length=4, max_length=12)
     expires_at: datetime | None = None
-    max_downloads: int | None = Field(default=None, ge=1)
-    encrypted_kf_b64: str | None = Field(default=None)
-    encrypted_kf_iv_b64: str | None = Field(default=None)
-    kf_salt_b64: str | None = Field(default=None)
+    max_downloads: int | None = Field(default=None, ge=1, le=2_147_483_647)
+    encrypted_kf_b64: str = Field(min_length=1, max_length=4096)
+    encrypted_kf_iv_b64: str = Field(min_length=1, max_length=64)
+    kf_salt_b64: str = Field(min_length=1, max_length=128)
+
+    @field_validator("encrypted_kf_b64", "encrypted_kf_iv_b64", "kf_salt_b64")
+    @classmethod
+    def _valid_key_material(cls, value: str, info) -> str:
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Invalid base64 key material") from exc
+        if info.field_name == "encrypted_kf_iv_b64" and len(decoded) != 12:
+            raise ValueError("AES-GCM IV must be 12 bytes")
+        if info.field_name == "kf_salt_b64" and len(decoded) < 16:
+            raise ValueError("Key salt must be at least 16 bytes")
+        if info.field_name == "encrypted_kf_b64" and len(decoded) != 48:
+            raise ValueError("Encrypted AES-256 key must be 48 bytes")
+        return value
+
+    @field_validator("expires_at")
+    @classmethod
+    def _future_expiration(cls, value: datetime | None) -> datetime | None:
+        if value is not None:
+            if value.tzinfo is None:
+                raise ValueError("Expiration requires a timezone")
+            if value <= datetime.now(UTC):
+                raise ValueError("Expiration must be in the future")
+        return value
 
 
 class SharedLinkRead(BaseModel):

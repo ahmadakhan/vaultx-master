@@ -18,18 +18,21 @@ export async function aesEncryptArrayBuffer(
   plain: ArrayBuffer,
   key: CryptoKey,
   iv?: Uint8Array<ArrayBuffer>,
+  additionalData?: Uint8Array<ArrayBuffer>,
 ) {
   // When an IV is supplied (chunked uploads) it MUST be the one persisted with
   // the ciphertext; otherwise generate a random one for single-shot messages.
   const ivBytes = iv ?? crypto.getRandomValues(new Uint8Array(IV_LEN));
-  const ct = await crypto.subtle.encrypt({ name: AES_ALGO, iv: ivBytes }, key, plain);
-  return { ciphertext_b64: bufToB64(ct), iv_b64: bufToB64(ivBytes.buffer as ArrayBuffer) };
+  if (ivBytes.byteLength !== IV_LEN) throw new Error("Invalid AES-GCM IV")
+  const ct = await crypto.subtle.encrypt({ name: AES_ALGO, iv: ivBytes, additionalData }, key, plain);
+  return { ciphertext_b64: bufToB64(ct), iv_b64: bufToB64(ivBytes.slice().buffer) };
 }
 
-export async function aesDecryptArrayBuffer(ciphertext_b64: string, iv_b64: string, key: CryptoKey): Promise<ArrayBuffer> {
+export async function aesDecryptArrayBuffer(ciphertext_b64: string, iv_b64: string, key: CryptoKey, additionalData?: Uint8Array<ArrayBuffer>): Promise<ArrayBuffer> {
   const ct = b64ToBuf(ciphertext_b64);
   const iv = new Uint8Array(b64ToBuf(iv_b64));
-  const plain = await crypto.subtle.decrypt({ name: AES_ALGO, iv }, key, ct);
+  if (iv.byteLength !== IV_LEN) throw new Error("Invalid AES-GCM IV")
+  const plain = await crypto.subtle.decrypt({ name: AES_ALGO, iv, additionalData }, key, ct);
   return plain;
 }
 

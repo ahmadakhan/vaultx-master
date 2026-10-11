@@ -1,154 +1,64 @@
-import { clearVaultXContext } from "./crypto/context";
+import { clearVaultXContext, getSessionContext } from "./crypto/context";
 
-class NetworkError extends Error {
-  constructor(message: string) {
+export class ApiError extends Error {
+  constructor(message: string, public readonly status: number) {
     super(message);
-    this.name = "NetworkError";
+    this.name = "ApiError";
   }
 }
 
+function errorDetail(detail: unknown): string {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    // Validation payloads can include the submitted password in `input`.
+    // Only display human-readable messages, never stringify the whole object.
+    const messages = detail.flatMap(item =>
+      item && typeof item.msg === "string" ? [item.msg] : []);
+    if (messages.length) return messages.join("; ");
+  }
+  return "Request failed. Please try again.";
+}
+
+async function request(endpoint: string, token: string | undefined, init: RequestInit = {}): Promise<Response> {
+  const path = endpoint.replace(/^\/+/, "");
+  if (!path || path.includes("://")) throw new Error("Invalid API endpoint");
+  const headers = new Headers(init.headers);
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  let response: Response;
+  try {
+    response = await fetch(`/api/${path}`, { ...init, headers, cache: "no-store", credentials: "same-origin" });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") throw error;
+    throw new Error("Server unreachable. Please try again later.");
+  }
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    if (response.status === 401 && token && token === getSessionContext()?.accessToken) {
+      clearVaultXContext();
+      if (typeof window !== "undefined") window.location.assign("/");
+    }
+    throw new ApiError(errorDetail(payload?.detail), response.status);
+  }
+  return response;
+}
+
+async function jsonResponse(response: Response) {
+  if (response.status === 204) return {};
+  try { return await response.json(); }
+  catch { throw new ApiError("The server returned an invalid response.", response.status); }
+}
+
 export const api = {
-  post: async (endpoint: string, data?: unknown, token?: string, json = true) => {
-    try {
-      const headers: Record<string, string> = token
-        ? { Authorization: `Bearer ${token}` }
-        : {};
-      if (json) headers["Content-Type"] = "application/json";
-
-      const res = await fetch(`/api/${endpoint}`, {
-        method: "POST",
-        headers,
-        body: json ? JSON.stringify(data) : (data as BodyInit),
-      });
-
-      const data_ = await res.json().catch(() => ({}));
-
-      if (res.status === 401 && data_.detail == "Invalid or expired token") {
-        clearVaultXContext();
-        alert("Please log in again.");
-        window.location.href = "/";
-      }
-
-      if (!res.ok) throw new Error(data_.detail || "Something went wrong.");
-      return data_;
-    } catch (error) {
-      if (
-        error instanceof TypeError ||
-        (error as Error).message === "Failed to fetch"
-      ) {
-        throw new NetworkError("Server unreachable. Please try again later.");
-      }
-      throw error;
-    }
-  },
-
-  get: async (endpoint: string, token?: string, extraHeaders?: Record<string, string>) => {
-    try {
-      const res = await fetch(`/api/${endpoint}`, {
-        headers: {
-          Accept: "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          ...(extraHeaders || {}),
-        },
-      });
-
-      const data_ = await res.json().catch(() => ({}));
-
-      if (res.status === 401 && data_.detail == "Invalid or expired token") {
-        clearVaultXContext();
-        alert("Please log in again.");
-        window.location.href = "/";
-      }
-
-      if (!res.ok) throw new Error(data_.detail || "Something went wrong.");
-      return data_;
-    } catch (error) {
-      if (
-        error instanceof TypeError ||
-        (error as Error).message === "Failed to fetch"
-      ) {
-        throw new NetworkError("Server unreachable. Please try again later.");
-      }
-      throw error;
-    }
-  },
-
-  /**
-   * GET a download endpoint, returning the raw Response so callers can
-   * stream large file bodies or issue Range requests.
-   */
-  getRaw: async (
-    endpoint: string,
-    token?: string,
-    range?: string,
-    extraHeaders?: Record<string, string>,
-  ) => {
-    try {
-      const headers: Record<string, string> = {
-        Accept: "application/octet-stream",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        ...(extraHeaders || {}),
-      };
-      if (range) {
-        headers["Range"] = range;
-      }
-
-      const res = await fetch(`/api/${endpoint}`, { headers });
-
-      if (res.status === 401) {
-        const data_ = await res.json().catch(() => ({}));
-        if (data_.detail == "Invalid or expired token") {
-          clearVaultXContext();
-          alert("Please log in again.");
-          window.location.href = "/";
-        }
-      }
-
-      if (!res.ok) {
-        const data_ = await res.json().catch(() => ({}));
-        throw new Error(data_.detail || "Something went wrong.");
-      }
-      return res;
-    } catch (error) {
-      if (
-        error instanceof TypeError ||
-        (error as Error).message === "Failed to fetch"
-      ) {
-        throw new NetworkError("Server unreachable. Please try again later.");
-      }
-      throw error;
-    }
-  },
-
-  delete: async (endpoint: string, token?: string) => {
-    try {
-      const res = await fetch(`/api/${endpoint}`, {
-        method: "DELETE",
-        headers: {
-          Accept: "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-      });
-
-      const data_ = await res.json().catch(() => ({}));
-
-
-      if (res.status === 401 && data_.detail === "Invalid or expired token") {
-        clearVaultXContext();
-        alert("Please log in again.");
-        window.location.href = "/";
-      }
-
-      if (!res.ok) throw new Error(data_.detail || "Something went wrong.");
-      return data_;
-    } catch (error) {
-      if (
-        error instanceof TypeError ||
-        (error as Error).message === "Failed to fetch"
-      ) {
-        throw new NetworkError("Server unreachable. Please try again later.");
-      }
-      throw error;
-    }
-  },
+  post: async (endpoint: string, data?: unknown, token?: string, json = true) =>
+    jsonResponse(await request(endpoint, token, {
+      method: "POST",
+      headers: json ? { "Content-Type": "application/json" } : {},
+      body: json ? JSON.stringify(data) : data as BodyInit,
+    })),
+  get: async (endpoint: string, token?: string, extraHeaders?: Record<string, string>) =>
+    jsonResponse(await request(endpoint, token, { headers: { Accept: "application/json", ...extraHeaders } })),
+  getRaw: async (endpoint: string, token?: string, range?: string, extraHeaders?: Record<string, string>) =>
+    request(endpoint, token, { headers: { Accept: "application/octet-stream", ...(range ? { Range: range } : {}), ...extraHeaders } }),
+  delete: async (endpoint: string, token?: string) =>
+    jsonResponse(await request(endpoint, token, { method: "DELETE" })),
 };

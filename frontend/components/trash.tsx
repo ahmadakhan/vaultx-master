@@ -1,4 +1,5 @@
 "use client";
+import { memorySession } from "@/lib/crypto/context";
 
 import { useState, useCallback, useEffect } from "react";
 import { Button } from "@/components/ui/button";
@@ -20,7 +21,7 @@ export function Trash() {
   const [error, setError] = useState<string | null>(null);
 
   const decryptFiles = useCallback(async (filesRaw: RawFile[]) => {
-    const masterKey_b64 = sessionStorage.getItem("vaultx_master_key");
+    const masterKey_b64 = memorySession.getItem("vaultx_master_key");
     if (!masterKey_b64)
       throw new Error("Missing master key — please log in again.");
 
@@ -35,7 +36,7 @@ export function Trash() {
           masterKey_b64
         );
         const kf_b64 = bufToB64(kf_bytes.buffer);
-        sessionStorage.setItem(`vaultx_kf_${f.id}`, kf_b64);
+        memorySession.setItem(`vaultx_kf_${f.id}`, kf_b64);
 
         const metadataJson = await decryptStringWithAes(
           f.metadata_ciphertext,
@@ -161,7 +162,7 @@ export function Trash() {
         ) : files.length === 0 ? (
           <EmptyState
             title="The bin is empty"
-            description="Files you delete are moved here and kept for 30 days before permanent removal."
+            description="Deleted files stay here until you restore them or permanently delete them."
             actionLabel="Refresh"
             onAction={fetchTrash}
           />

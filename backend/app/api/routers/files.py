@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,7 +30,9 @@ from fastapi import (
     File as FastAPIFile,
 )
 from sqlalchemy import and_, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from app.core.audit_decorator import audit_event
 from app.core.deps import get_current_user, get_current_user_mfa_verified
@@ -43,6 +44,7 @@ from app.schemas.file import (
     FileBatchList,
     FileListPage,
     FileUploadResponse,
+    parse_token_entries,
 )
 from app.storage import get_storage
 
@@ -175,15 +177,42 @@ async def upload_file(
     except (ValueError, AttributeError) as exc:
         raise ValidationError("Invalid file_id format") from exc
 
+    if not 1 <= total_chunks <= 10000 or not 0 <= chunk_index < total_chunks:
+        raise ValidationError("Invalid chunk sequence")
+    if is_last_chunk and chunk_index != total_chunks - 1:
+        raise ValidationError("Invalid final chunk")
     is_chunked = total_chunks > 1
 
     # --- Decode form fields (required on first chunk, optional on subsequent) ---
     if chunk_index == 0 or not is_chunked:
+        if any(len(value) > 8192 for value in (
+            metadata_ciphertext, metadata_iv, encrypted_kf_b64, encrypted_kf_iv, file_iv
+        )) or len(tokens_json) > 5_000_000:
+            raise ValidationError("Upload metadata is too large")
         metadata_bytes = _decode_b64(metadata_ciphertext)
         metadata_iv_b = _decode_b64(metadata_iv)
         encrypted_kf = _decode_b64(encrypted_kf_b64)
         encrypted_kf_iv_b = _decode_b64(encrypted_kf_iv)
         file_iv_b = _decode_b64(file_iv)
+        if any(len(iv) != 12 for iv in (metadata_iv_b, encrypted_kf_iv_b, file_iv_b)):
+            raise ValidationError("AES-GCM IVs must be 12 bytes")
+        if not metadata_bytes or not encrypted_kf:
+            raise ValidationError("Encrypted metadata and file key are required")
+        try:
+            tokens = parse_token_entries(tokens_json or "[]")
+            seen = set()
+            for entry in tokens:
+                token = _decode_b64(entry.token)
+                if len(token) != 32 or token in seen:
+                    raise ValueError("Invalid or duplicate search token")
+                seen.add(token)
+                if entry.prev_token and len(_decode_b64(entry.prev_token)) != 32:
+                    raise ValueError("Invalid previous token")
+                _decode_b64(entry.value.ciphertext_b64)
+                if len(_decode_b64(entry.value.iv_b64)) != 12:
+                    raise ValueError("Invalid token IV")
+        except ValueError as exc:
+            raise ValidationError("Invalid search tokens") from exc
     else:
         metadata_bytes = b""
         metadata_iv_b = b""
@@ -194,64 +223,47 @@ async def upload_file(
         encrypted_kf_iv_b = b""
         file_iv_b = b""
 
-    # On the first chunk, record metadata for the file record and check conflicts
-    if chunk_index == 0:
-        existing = await db.get(File, file_uuid)
-        if existing:
-            raise ConflictError("File ID already exists")
+    existing = await db.get(File, file_uuid)
+    if existing:
+        raise ConflictError("File ID already exists")
 
     storage = get_storage()
 
-    # --- Stream the chunk directly to the filesystem ---
-    chunk_bytes: list[bytes] = []
-    total = 0
-    max_bytes = _settings.max_upload_bytes
+    # Namespacing prevents another account from continuing/cancelling a session.
+    upload_id = str(uuid.uuid5(current_user.id, str(file_uuid)))
+    metadata = None
+    if chunk_index == 0:
+        metadata = {
+            "metadata_ciphertext": metadata_ciphertext, "metadata_iv": metadata_iv,
+            "encrypted_kf_b64": encrypted_kf_b64, "encrypted_kf_iv": encrypted_kf_iv,
+            "file_iv": file_iv, "tokens": [entry.model_dump() for entry in tokens],
+        }
     try:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > max_bytes:
-                storage.cancel_upload(str(file_uuid))
-                raise ValidationError(f"Upload exceeds maximum size of {max_bytes} bytes")
-            chunk_bytes.append(chunk)
+        with storage.upload_lock(upload_id):
+            upload_complete = await run_in_threadpool(storage.write_chunk,
+                upload_id, chunk_index, total_chunks, file.file, is_last_chunk,
+                max_bytes=_settings.max_upload_bytes, metadata=metadata,
+            )
+            if not upload_complete:
+                return FileUploadResponse(id=file_uuid, created_at=_get_current_time())
+            saved = storage.upload_metadata(upload_id)
+            metadata_bytes = _decode_b64(saved["metadata_ciphertext"])
+            metadata_iv_b = _decode_b64(saved["metadata_iv"])
+            encrypted_kf = _decode_b64(saved["encrypted_kf_b64"])
+            encrypted_kf_iv_b = _decode_b64(saved["encrypted_kf_iv"])
+            file_iv_b = _decode_b64(saved["file_iv"])
+            tokens = saved["tokens"]
+            if tokens:
+                existing_tokens = await db.execute(select(IndexEntry.token).where(
+                    IndexEntry.owner_id == current_user.id,
+                    IndexEntry.token.in_([_decode_b64(entry["token"]) for entry in tokens]),
+                ))
+                if existing_tokens.first():
+                    raise ConflictError("Search token already exists")
+            blob_path = storage._final_path(str(file_uuid))
+            blob_size = storage.upload_size(upload_id)
     finally:
         await file.close()
-
-    data = b"".join(chunk_bytes)
-
-    # Write the chunk to filesystem staging area
-    upload_complete = storage.write_chunk(
-        upload_id=str(file_uuid),
-        chunk_index=chunk_index,
-        total_chunks=total_chunks,
-        data=data,
-        is_last=is_last_chunk,
-    )
-
-    # If not the final chunk, return a partial-success response
-    if not upload_complete:
-        return FileUploadResponse(
-            id=file_uuid,
-            created_at=_get_current_time(),
-        )
-
-    # Finalize: move assembled blob to its final location
-    storage.finalize_upload(str(file_uuid), str(file_uuid))
-    blob_path = storage._final_path(str(file_uuid))
-    blob_size = os.path.getsize(str(blob_path))
-
-    # Process search tokens (collected on every chunk to be safe — dedup by token)
-    try:
-        tokens = json.loads(tokens_json) if tokens_json else []
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise ValidationError("Invalid tokens JSON") from exc
-
-    # Create the DB record
-    if not metadata_bytes and chunk_index == 0 and is_chunked:
-        # Fallback: should not happen if client sends metadata on first chunk
-        raise ValidationError("Metadata required on first chunk")
 
     new_file = File(
         id=file_uuid,
@@ -266,7 +278,6 @@ async def upload_file(
         file_iv=file_iv_b,
     )
     db.add(new_file)
-    await db.flush()
 
     for t in tokens:
         token_b = _decode_b64(t["token"])
@@ -291,7 +302,16 @@ async def upload_file(
             )
         )
 
-    await db.commit()
+    try:
+        # Check all DB constraints before publishing a blob. The unique file ID
+        # also serializes competing owners attempting to publish the same ID.
+        await db.flush()
+        with storage.upload_lock(upload_id):
+            await run_in_threadpool(storage.finalize_upload, upload_id, str(file_uuid))
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise ConflictError("File or search token already exists") from exc
     await db.refresh(new_file)
 
     logger.info(
@@ -492,6 +512,8 @@ async def get_file(
         raise NotFoundError("File not found")
 
     f, owner_email = entry
+    if f.deleted and f.owner_id != current_user.id:
+        raise NotFoundError("File not found")
     item = _build_file_dict(f, owner_email, include_kf=bool(f.owner_id == current_user.id))
 
     if f.owner_id != current_user.id:
@@ -609,9 +631,9 @@ async def download_file(
     blob_path: Path | None = None
 
     if f.storage_path:
-        blob_path = Path(f.storage_path)
-        if blob_path.exists():
-            total_size = blob_path.stat().st_size
+        blob_path = get_storage().validated_path(str(f.id), f.storage_path)
+        total_size = blob_path.stat().st_size
+        blob_size = total_size
 
     if range:
         # Parse Range header: "bytes=start-end"
@@ -634,7 +656,7 @@ async def download_file(
 
         range_end = total_size - 1 if range_end is None else min(range_end, total_size - 1)
 
-        if range_start > total_size - 1 or range_start > range_end:
+        if range_start < 0 or range_start > total_size - 1 or range_start > range_end:
             range_not_satisfiable = JSONResponse(
                 status_code=416,
                 content={"detail": "Range not satisfiable"},
@@ -708,7 +730,7 @@ async def download_file(
     # Small file or legacy DB-stored ciphertext — inline response
     return {
         "id": str(f.id),
-        "ciphertext": base64.b64encode(f.ciphertext or b"").decode(),
+        "ciphertext": base64.b64encode(blob_path.read_bytes() if blob_path else (f.ciphertext or b"")).decode(),
         "file_iv": file_iv_b64,
         "metadata_ciphertext": metadata_ct_b64,
         "metadata_iv": metadata_iv_b64,
@@ -750,7 +772,7 @@ async def delete_file(
     except (ValueError, AttributeError) as exc:
         raise ValidationError("Invalid file_id format") from exc
 
-    file = await db.get(File, file_uuid)
+    file = await db.get(File, file_uuid, with_for_update=True)
     if not file:
         raise NotFoundError("File not found")
 
@@ -795,7 +817,7 @@ async def restore_file(
     except (ValueError, AttributeError) as exc:
         raise ValidationError("Invalid file_id format") from exc
 
-    file = await db.get(File, file_uuid)
+    file = await db.get(File, file_uuid, with_for_update=True)
     if not file:
         raise NotFoundError("File not found")
 
@@ -843,7 +865,7 @@ async def purge_file(
     except (ValueError, AttributeError) as exc:
         raise ValidationError("Invalid file_id format") from exc
 
-    file = await db.get(File, file_uuid)
+    file = await db.get(File, file_uuid, with_for_update=True)
     if not file:
         raise NotFoundError("File not found")
 
@@ -854,12 +876,11 @@ async def purge_file(
         raise ValidationError("File must be in the trash before it can be purged")
 
     file_id_str = str(file.id)
-    if file.storage_path:
-        storage = get_storage()
-        storage.delete_blob(file_id_str)
-
+    has_blob = bool(file.storage_path)
     await db.delete(file)
     await db.commit()
+    if has_blob:
+        get_storage().delete_blob(file_id_str)
 
     logger.info("File purged", extra={"file_id": file_id_str, "user_id": str(current_user.id)})
     return {"message": "File permanently deleted"}

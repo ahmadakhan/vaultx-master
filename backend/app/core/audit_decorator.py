@@ -68,7 +68,8 @@ def audit_event(
     """
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-        params = inspect.signature(func).parameters
+        signature = inspect.signature(func, eval_str=True)
+        params = signature.parameters
         missing = [name for name in ("request", "db") if name not in params]
         if missing:
             raise TypeError(
@@ -80,7 +81,7 @@ def audit_event(
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
             response = await func(*args, **kwargs)
 
-            user_id = getattr(kwargs.get("current_user"), "id", None)
+            user_id = getattr(kwargs.get("current_user") or kwargs.get("current_admin"), "id", None)
             if user_id is None:
                 user_id = _resolve_user_id(response)
 
@@ -88,6 +89,10 @@ def audit_event(
                 field: str(kwargs[field])
                 for field in resource_fields
                 if kwargs.get(field) is not None
+                and not any(
+                    secret in field.lower()
+                    for secret in ("token", "password", "secret", "code", "key")
+                )
             }
 
             try:
@@ -98,13 +103,18 @@ def audit_event(
                     action=action,
                     resource=resource or None,
                 )
-            except Exception as exc:
+            except Exception:
+                await kwargs["db"].rollback()
                 logger.error(
                     "Failed to record audit log",
-                    extra={"action": action, "error": str(exc)},
+                    extra={"action": action},
                 )
             return response
 
+        # FastAPI otherwise resolves postponed annotations in this wrapper's
+        # globals, misclassifying Request as a required query parameter and
+        # leaving endpoint-local model/UUID references unresolved.
+        wrapper.__signature__ = signature  # type: ignore[attr-defined]
         return wrapper
 
     return decorator

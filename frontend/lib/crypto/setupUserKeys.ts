@@ -1,9 +1,10 @@
-import { deriveMasterKey, generateSearchKey, generateRSAKeyPair, generateFileKey } from "./keys";
+import { deriveMasterKey, generateSearchKey, generateRSAKeyPair, generateFileKey, CURRENT_ACCOUNT_PBKDF2_ITERATIONS } from "./keys";
 import { aesEncryptArrayBuffer } from "./aes";
+import { bundleAad } from "./bundle";
 
 export async function prepareUserKeyBundle(password: string) {
   // 1. Derive password-based key
-  const { key: pwKey, salt_b64 } = await deriveMasterKey(password);
+  const { key: pwKey, salt_b64 } = await deriveMasterKey(password, undefined, CURRENT_ACCOUNT_PBKDF2_ITERATIONS);
 
   // 2. Generate core keys
   const masterKey_b64 = await generateFileKey(); // Km
@@ -13,19 +14,21 @@ export async function prepareUserKeyBundle(password: string) {
   // 3. Encrypt sensitive ones under password-derived key
   const encMaster = await aesEncryptArrayBuffer(
     Uint8Array.from(atob(masterKey_b64), (c) => c.charCodeAt(0)).buffer,
-    pwKey
+    pwKey, undefined, bundleAad("master")
   );
 
   const encSearch = await aesEncryptArrayBuffer(
     Uint8Array.from(atob(searchKey_b64), (c) => c.charCodeAt(0)).buffer,
-    pwKey
+    pwKey, undefined, bundleAad("search")
   );
 
   const privBuf = Uint8Array.from(atob(rsaPair.privateKey_b64), (c) => c.charCodeAt(0)).buffer;
-  const encPriv = await aesEncryptArrayBuffer(privBuf, pwKey);
+  const encPriv = await aesEncryptArrayBuffer(privBuf, pwKey, undefined, bundleAad("private"));
 
   // 4. Return the payload to send to backend
   return {
+    key_bundle_version: 2,
+    kdf_iterations: CURRENT_ACCOUNT_PBKDF2_ITERATIONS,
     password_salt_b64: salt_b64,
     enc_master_key_b64: encMaster.ciphertext_b64,
     enc_master_key_iv: encMaster.iv_b64,
