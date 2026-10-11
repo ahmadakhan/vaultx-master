@@ -17,6 +17,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
@@ -33,9 +34,10 @@ from app.api import router as api_router
 from app.config import settings
 from app.core.exceptions import VaultXError, get_exception_handler
 from app.core.logging import get_logger, setup_logging
+from app.core.security import hash_password
 from app.db import AsyncSessionLocal, engine
 from app.middleware import RateLimitMiddleware, SecurityHeadersMiddleware
-from app.models import Base, Role
+from app.models import Base, Role, User, UserRole, email_matches, normalize_email
 
 logger = get_logger(__name__)
 
@@ -168,6 +170,74 @@ async def _trash_reaper_loop() -> None:
             logger.exception("Trash reaper iteration failed")
 
 
+async def seed_bootstrap_admin(
+    session: Any,
+    *,
+    email: str | None = None,
+    password: str | None = None,
+) -> bool:
+    """Create or update an optional bootstrap admin account.
+
+    This is intentionally disabled unless one of the supported admin bootstrap
+    environment variables is configured, so ordinary public registration still
+    remains non-admin by default.
+    """
+    admin_email = normalize_email((email or settings.bootstrap_admin_email or "").strip())
+    admin_password = (password if password is not None else settings.bootstrap_admin_password or "").strip()
+    if not admin_email or not admin_password:
+        return False
+
+    from sqlalchemy import select as _select
+
+    result = await session.execute(_select(User).where(email_matches(User.email, admin_email)))
+    user = result.scalar_one_or_none()
+    roles = {"user", "admin"}
+    if user is None:
+        def _rand_bytes(length: int) -> bytes:
+            return secrets.token_bytes(length)
+
+        user = User(
+            email=admin_email,
+            password_hash=hash_password(admin_password),
+            password_salt_b64=_rand_bytes(16),
+            enc_master_key_b64=_rand_bytes(48),
+            enc_master_key_iv=_rand_bytes(12),
+            enc_search_key_b64=_rand_bytes(48),
+            enc_search_key_iv=_rand_bytes(12),
+            enc_private_key_b64=_rand_bytes(128),
+            enc_private_key_iv=_rand_bytes(12),
+            public_key_b64=_rand_bytes(256),
+            key_bundle_version=2,
+            password_kdf_iterations=600000,
+            is_active=True,
+        )
+        session.add(user)
+        await session.flush()
+        roles = {"user", "admin"}
+    else:
+        user.is_active = True
+        if not user.password_hash:
+            user.password_hash = hash_password(admin_password)
+        else:
+            # Allow the bootstrap account to be refreshed if a deployment sets a
+            # new password without disturbing the rest of the record.
+            user.password_hash = hash_password(admin_password)
+
+    for role_name in sorted(roles):
+        existing = await session.execute(
+            _select(UserRole).where(UserRole.user_id == user.id, UserRole.role == role_name)
+        )
+        if existing.scalar_one_or_none() is None:
+            session.add(UserRole(user_id=user.id, role=role_name))
+
+    await session.commit()
+    logger.warning(
+        "Bootstrap admin account ensured",
+        extra={"email": admin_email},
+    )
+    return True
+
+
 def _create_lifespan() -> Any:
     """Create the lifespan context manager for startup/shutdown."""
 
@@ -190,6 +260,8 @@ def _create_lifespan() -> Any:
                     session.add(Role(name=role_name))
             await session.commit()
             logger.info("Default roles seeded")
+
+            await seed_bootstrap_admin(session)
 
         logger.info(
             "VaultX backend started",

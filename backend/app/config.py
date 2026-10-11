@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.logging import get_logger
@@ -94,7 +94,23 @@ class Settings(BaseSettings):
     # --- Login throttling ---
     login_max_attempts: int = Field(5, alias="LOGIN_MAX_ATTEMPTS", ge=1, le=100)
     login_lockout_seconds: int = Field(900, alias="LOGIN_LOCKOUT_SECONDS", ge=1)
-
+    # --- Bootstrap admin (optional, for local dev or managed deployments) ---
+    bootstrap_admin_email: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "BOOTSTRAP_ADMIN_EMAIL",
+            "APP_ADMIN_EMAIL",
+            "ADMIN_EMAIL",
+        ),
+    )
+    bootstrap_admin_password: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "BOOTSTRAP_ADMIN_PASSWORD",
+            "APP_ADMIN_PASSWORD",
+            "ADMIN_PASSWORD",
+        ),
+    )
     # --- Upload ---
     max_upload_bytes: int = Field(11_000_000_000, alias="MAX_UPLOAD_BYTES", ge=1)
     storage_dir: str = Field("/var/vaultx/storage", alias="STORAGE_DIR")

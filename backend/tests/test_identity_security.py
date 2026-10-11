@@ -175,6 +175,23 @@ else:
         assert response.status_code == 403
 
     @pytest.mark.asyncio
+    async def test_bootstrap_admin_seeded_from_env(rig):
+        email = "admin@example.com"
+        password = "BootstrapPass123!"
+
+        from app.main import seed_bootstrap_admin
+
+        async with rig.sessions() as db:
+            await seed_bootstrap_admin(db, email=email, password=password)
+            user = await db.scalar(select(rig.m.User).where(rig.m.User.email == email))
+            assert user is not None
+            assert user.is_active is True
+            assert rig.m.security.verify_password(password, user.password_hash) is True
+            roles = (await db.scalars(select(rig.m.UserRole.role).where(rig.m.UserRole.user_id == user.id))).all()
+            assert "user" in roles
+            assert "admin" in roles
+
+    @pytest.mark.asyncio
     async def test_legacy_bundle_metadata_and_ciphertext_preserved(rig, bundle):
         legacy = {
             key: value
