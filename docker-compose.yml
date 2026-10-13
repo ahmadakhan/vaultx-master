@@ -32,6 +32,24 @@ services:
       timeout: 3s
       retries: 12
 
+  minio:
+    image: minio/minio:RELEASE.2025-10-15T17-29-55Z
+    container_name: vaultx_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}
+    volumes:
+      - minio_data:/data
+    networks:
+      - vaultx_net
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
   backend:
     build: ./backend
     container_name: vaultx_backend
@@ -82,10 +100,22 @@ services:
       RATE_LIMIT_REDIS_URL: redis://redis:6379/0
       RATE_LIMIT_REDIS_TIMEOUT_SECONDS: 0.15
       METRICS_ENABLED: "true"
+      BACKUP_ENABLED: ${BACKUP_ENABLED:-false}
+      BACKUP_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:-http://minio:9000}
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:-vaultx-backups}
+      BACKUP_S3_ACCESS_KEY: ${MINIO_BACKUP_ACCESS_KEY:-}
+      BACKUP_S3_SECRET_KEY: ${MINIO_BACKUP_SECRET_KEY:-}
+      BACKUP_S3_REGION: ${BACKUP_S3_REGION:-us-east-1}
+      BACKUP_OBJECT_LOCK_DAYS: ${BACKUP_OBJECT_LOCK_DAYS:-30}
+      BACKUP_WORK_DIR: /var/vaultx/backup
+      BACKUP_INTERVAL_MINUTES: ${BACKUP_INTERVAL_MINUTES:-1440}
+      AUDIT_DELIVERY_INTERVAL_SECONDS: ${AUDIT_DELIVERY_INTERVAL_SECONDS:-30}
     depends_on:
       migrate:
         condition: service_completed_successfully
       redis:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     networks:
       - vaultx_net
@@ -94,12 +124,21 @@ services:
       - vaultx_signing_keys:/etc/vaultx/signing_keys
       - vaultx_storage:/var/vaultx/storage
       - vaultx_logs:/var/vaultx/logs
+      - vaultx_backup:/var/vaultx/backup
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3)"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  backup-worker:
+    profiles: [backup]
+    extends:
+      service: backend
+    container_name: vaultx_backup_worker
+    command: ["python", "-m", "app.backup_worker"]
+    restart: unless-stopped
 
   migrate:
     build: ./backend
@@ -143,6 +182,53 @@ services:
     ports:
       - "${PORT:-3000}:3000"
 
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: vaultx_prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    volumes:
+      - ./ops/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    networks: [vaultx_net]
+    depends_on:
+      backend:
+        condition: service_started
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: vaultx_alertmanager
+    restart: unless-stopped
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml", "--config.expand-env", "--storage.path=/alertmanager"]
+    environment:
+      ALERTMANAGER_WEBHOOK_URL: ${ALERTMANAGER_WEBHOOK_URL:?ALERTMANAGER_WEBHOOK_URL must be set}
+    volumes:
+      - ./ops/alertmanager:/etc/alertmanager:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - "${ALERTMANAGER_PORT:-9093}:9093"
+    networks: [vaultx_net]
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: vaultx_grafana
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    networks: [vaultx_net]
+    depends_on: [prometheus]
+
 networks:
   vaultx_net:
     driver: bridge
@@ -153,3 +239,8 @@ volumes:
   vaultx_signing_keys:
   vaultx_storage:
   vaultx_logs:
+  vaultx_backup:
+  minio_data:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:

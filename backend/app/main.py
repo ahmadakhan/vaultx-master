@@ -43,6 +43,7 @@ from app.middleware import (
     ObservabilityMiddleware,
     RateLimitMiddleware,
     SecurityHeadersMiddleware,
+    increment,
     prometheus,
 )
 from app.models import (
@@ -446,6 +447,8 @@ def create_app() -> FastAPI:
     async def readiness(response: Response) -> dict[str, Any]:
         """Report whether the API can serve requests backed by its database."""
         db_ready = await _database_ready()
+        if not db_ready:
+            increment("readiness_failures_total")
         response.status_code = 200 if db_ready else 503
         return {
             "status": "ok" if db_ready else "degraded",

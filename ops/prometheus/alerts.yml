@@ -1,0 +1,24 @@
+groups:
+  - name: vaultx-operations
+    rules:
+      - alert: VaultXReadinessFailing
+        expr: up{job="vaultx-api"} == 0 or increase(vaultx_readiness_failures_total[5m]) > 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: VaultX metrics endpoint is unreachable
+          description: Prometheus cannot scrape the API; check /health/ready and backend logs.
+      - alert: VaultXHighApiLatency
+        expr: rate(vaultx_http_request_duration_seconds_sum[5m]) / clamp_min(rate(vaultx_http_requests_total[5m]), 1) > 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: VaultX API latency is above one second
+          description: The five-minute request duration average exceeded one second.
+      - alert: VaultXRedisFallbackActive
+        expr: increase(vaultx_rate_limit_redis_failures_total[5m]) > 0
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: VaultX rate limiting fell back to local buckets
+          description: Redis failures were observed; restore Redis before relying on shared limits.

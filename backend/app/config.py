@@ -12,7 +12,7 @@ import ipaddress
 from functools import cached_property
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     # The server stores and returns only authenticated ciphertext envelopes.
     # There is intentionally no mode that accepts plaintext vault keys.
     key_bundle_mode: str = Field("server-blind-envelope", alias="KEY_BUNDLE_MODE")
+    password_auth_mode: str = Field("legacy-bcrypt", alias="PASSWORD_AUTH_MODE")
 
     # --- CORS ---
     allowed_origins: str = Field("http://localhost:3000", alias="ALLOWED_ORIGINS")
@@ -97,8 +98,17 @@ class Settings(BaseSettings):
     rate_limit_capacity: int = Field(200, alias="RATE_LIMIT_CAPACITY", ge=1)
     rate_limit_max_buckets: int = Field(50_000, alias="RATE_LIMIT_MAX_BUCKETS", ge=100)
     rate_limit_redis_url: str | None = Field(default=None, alias="RATE_LIMIT_REDIS_URL")
-    rate_limit_redis_timeout_seconds: float = Field(0.15, alias="RATE_LIMIT_REDIS_TIMEOUT_SECONDS", gt=0, le=5)
+    rate_limit_redis_timeout_seconds: float = Field(
+        0.15, alias="RATE_LIMIT_REDIS_TIMEOUT_SECONDS", gt=0, le=5
+    )
     metrics_enabled: bool = Field(True, alias="METRICS_ENABLED")
+
+    # --- Self-hosted Keycloak / SCIM provisioning (disabled unless complete) ---
+    oidc_issuer_url: str | None = Field(None, alias="OIDC_ISSUER_URL")
+    oidc_jwks_url: str | None = Field(None, alias="OIDC_JWKS_URL")
+    oidc_audience: str | None = Field(None, alias="OIDC_AUDIENCE")
+    scim_bearer_token: str | None = Field(None, alias="SCIM_BEARER_TOKEN", repr=False)
+    scim_tenant_id: str | None = Field(None, alias="SCIM_TENANT_ID")
 
     # --- Login throttling ---
     login_max_attempts: int = Field(5, alias="LOGIN_MAX_ATTEMPTS", ge=1, le=100)
@@ -123,6 +133,19 @@ class Settings(BaseSettings):
     # --- Upload ---
     max_upload_bytes: int = Field(11_000_000_000, alias="MAX_UPLOAD_BYTES", ge=1)
     storage_dir: str = Field("/var/vaultx/storage", alias="STORAGE_DIR")
+
+    # S3-compatible recovery archive (MinIO in the self-hosted deployment).
+    # Credentials are intentionally required only when the adapter is enabled.
+    backup_enabled: bool = Field(False, alias="BACKUP_ENABLED")
+    backup_endpoint: str | None = Field(None, alias="BACKUP_S3_ENDPOINT")
+    backup_bucket: str = Field("vaultx-backups", alias="BACKUP_S3_BUCKET")
+    backup_access_key: str | None = Field(None, alias="BACKUP_S3_ACCESS_KEY", repr=False)
+    backup_secret_key: str | None = Field(None, alias="BACKUP_S3_SECRET_KEY", repr=False)
+    backup_region: str = Field("us-east-1", alias="BACKUP_S3_REGION")
+    backup_object_lock_days: int = Field(30, alias="BACKUP_OBJECT_LOCK_DAYS", ge=1)
+    backup_work_dir: str = Field("/var/vaultx/backup", alias="BACKUP_WORK_DIR")
+    backup_interval_minutes: int = Field(1440, alias="BACKUP_INTERVAL_MINUTES", ge=5)
+    audit_delivery_interval_seconds: int = Field(30, alias="AUDIT_DELIVERY_INTERVAL_SECONDS", ge=5)
 
     # --- WebAuthn ---
     # These values are intentionally explicit and are used for both option
@@ -178,6 +201,13 @@ class Settings(BaseSettings):
             )
         if self.app_secret_key == self.jwt_secret_key:
             raise ValueError("APP_SECRET_KEY and JWT_SECRET_KEY must be different values")
+        if self.backup_enabled and not all(
+            (self.backup_endpoint, self.backup_access_key, self.backup_secret_key)
+        ):
+            raise ValueError(
+                "BACKUP_ENABLED requires BACKUP_S3_ENDPOINT, BACKUP_S3_ACCESS_KEY, "
+                "and BACKUP_S3_SECRET_KEY"
+            )
 
         weak = [
             name
@@ -202,6 +232,13 @@ class Settings(BaseSettings):
             raise ValueError(
                 "KEY_BUNDLE_MODE must be server-blind-envelope; plaintext key transport is unsupported"
             )
+        return value
+
+    @field_validator("password_auth_mode")
+    @classmethod
+    def _validate_password_auth_mode(cls, value: str) -> str:
+        if value not in {"legacy-bcrypt", "opaque-required"}:
+            raise ValueError("PASSWORD_AUTH_MODE must be legacy-bcrypt or opaque-required")
         return value
 
     @property
@@ -258,6 +295,31 @@ class Settings(BaseSettings):
             )
         if parsed.hostname != self.webauthn_rp_id:
             raise ValueError("WEBAUTHN_ORIGIN hostname must exactly match WEBAUTHN_RP_ID")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_external_identity(self) -> Any:
+        oidc = (self.oidc_issuer_url, self.oidc_jwks_url, self.oidc_audience)
+        if any(oidc) and not all(oidc):
+            raise ValueError(
+                "OIDC_ISSUER_URL, OIDC_JWKS_URL and OIDC_AUDIENCE must be set together"
+            )
+        for name, value in (
+            ("OIDC_ISSUER_URL", self.oidc_issuer_url),
+            ("OIDC_JWKS_URL", self.oidc_jwks_url),
+        ):
+            if value:
+                parsed = urlparse(value)
+                if parsed.scheme != "https" and parsed.hostname not in {
+                    "localhost",
+                    "127.0.0.1",
+                    "::1",
+                }:
+                    raise ValueError(f"{name} must use HTTPS outside localhost")
+        if self.scim_bearer_token and len(self.scim_bearer_token) < 32:
+            raise ValueError("SCIM_BEARER_TOKEN must be at least 32 characters")
+        if self.scim_bearer_token and not self.scim_tenant_id:
+            raise ValueError("SCIM_TENANT_ID is required when SCIM_BEARER_TOKEN is configured")
         return self
 
 

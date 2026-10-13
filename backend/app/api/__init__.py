@@ -19,6 +19,8 @@ from app.api.routers.audit import router as audit_router
 from app.api.routers.auth import router as auth_router
 from app.api.routers.files import router as files_router
 from app.api.routers.governance import router as governance_router
+from app.api.routers.oidc import router as oidc_router
+from app.api.routers.scim import router as scim_router
 from app.api.routers.search import router as search_router
 from app.api.routers.shares import router as shares_router
 from app.api.routers.transfers import router as transfers_router
@@ -37,6 +39,8 @@ router.include_router(admin_router)
 router.include_router(transfers_router)
 router.include_router(webauthn_router)
 router.include_router(governance_router)
+router.include_router(scim_router)
+router.include_router(oidc_router)
 
 __all__ = [
     "admin_router",

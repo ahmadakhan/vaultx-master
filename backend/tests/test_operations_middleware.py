@@ -1,5 +1,6 @@
 import pytest
 
+from app.middleware.observability import increment, prometheus
 from app.middleware.rate_limit import RateLimitMiddleware
 
 
@@ -34,3 +35,9 @@ async def test_redis_failure_falls_back_to_local_bucket():
     assert await middleware._allow("client")
     assert not await middleware._allow("client")
     assert middleware._redis_failed
+
+
+def test_prometheus_exposes_latency_metric_family():
+    increment("http_request_duration_seconds_sum", 0.01)
+    output = prometheus()
+    assert "vaultx_http_request_duration_seconds_sum" in output

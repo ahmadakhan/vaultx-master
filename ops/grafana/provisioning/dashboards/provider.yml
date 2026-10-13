@@ -1,0 +1,9 @@
+apiVersion: 1
+providers:
+  - name: VaultX operations
+    orgId: 1
+    folder: VaultX
+    type: file
+    disableDeletion: true
+    options:
+      path: /etc/grafana/provisioning/dashboards

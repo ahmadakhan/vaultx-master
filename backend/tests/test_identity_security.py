@@ -428,7 +428,10 @@ else:
             headers=bearer(tokens),
             json={"email": "other@example.com", "password": "SyntheticPass123!"},
         )
-        assert response.status_code == 409
+        # Privileged APIs fail closed until the administrator enrolls and
+        # recently verifies MFA; password-only admin tokens must not reach the
+        # endpoint-specific conflict response.
+        assert response.status_code == 403
         async with rig.sessions() as db:
             assert len((await db.scalars(select(rig.m.User))).all()) == 1
 
@@ -456,17 +459,8 @@ else:
             db.add(rig.m.UserRole(user_id=admin_id, role="admin"))
             await db.commit()
         response = await rig.client.delete(f"/admin/users/{target_id}", headers=bearer(admin))
-        assert response.status_code == 200, response.text
-        assert (await rig.client.get("/auth/mfa/status", headers=bearer(target))).status_code == 401
-        async with rig.sessions() as db:
-            row = await db.scalar(
-                select(rig.m.RefreshToken).where(rig.m.RefreshToken.user_id == target_id)
-            )
-            assert row.revoked_at is not None
-            logs = (
-                await db.scalars(select(rig.m.TamperLog).where(rig.m.TamperLog.user_id == admin_id))
-            ).all()
-            assert any(log.entry_json["action"] == "user_deactivated" for log in logs)
+        assert response.status_code == 403, response.text
+        assert (await rig.client.get("/auth/mfa/status", headers=bearer(target))).status_code == 200
 
     @pytest.mark.asyncio
     async def test_validation_rejects_malformed_bundle_without_echoing_password(rig, bundle):

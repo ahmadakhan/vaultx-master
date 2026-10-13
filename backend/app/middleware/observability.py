@@ -16,7 +16,7 @@ _metrics: Counter[str] = Counter()
 _lock = Lock()
 
 
-def increment(name: str, value: int = 1) -> None:
+def increment(name: str, value: float = 1) -> None:
     with _lock:
         _metrics[name] += value
 
@@ -58,6 +58,7 @@ class ObservabilityMiddleware:
             await self.app(scope, receive, send_wrapped)
         finally:
             increment("http_requests_total")
+            increment("http_request_duration_seconds_sum", time.perf_counter() - started)
             logger.info("Request completed", extra={"request_id": request_id, "trace_id": trace_id,
                 "method": scope.get("method"), "path": scope.get("path"),
                 "duration_ms": round((time.perf_counter() - started) * 1000, 2)})

@@ -3,6 +3,7 @@ annotated-types==0.7.0
 anyio==4.11.0
 asyncpg==0.30.0
 bcrypt==4.0.1
+boto3==1.40.62
 certifi==2025.10.5
 cffi==2.0.0
 charset-normalizer==3.4.4

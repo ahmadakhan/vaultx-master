@@ -211,6 +211,8 @@ async def _verify_factor(db: AsyncSession, user: User, code: str, *, backup: boo
 async def register_user(
     payload: RegisterPayload, db: AsyncSession = Depends(get_db)
 ) -> AuthResponse:
+    if settings.password_auth_mode == "opaque-required":
+        raise AuthenticationError("PAKE/OPAQUE authentication is required but not configured")
     email = normalize_email(str(payload.email))
     if await db.scalar(select(User.id).where(email_matches(User.email, email))):
         raise ConflictError("Email already registered")
@@ -264,6 +266,8 @@ async def register_user(
 async def login_user(
     user_in: UserLogin, request: Request, db: AsyncSession = Depends(get_db)
 ) -> AuthResponse:
+    if settings.password_auth_mode == "opaque-required":
+        raise AuthenticationError("PAKE/OPAQUE authentication is required but not configured")
     email = normalize_email(str(user_in.email))
     await reserve_attempt(db, "password", email)
     user = await db.scalar(select(User).where(email_matches(User.email, email)))
