@@ -18,12 +18,12 @@ from app.api.routers.admin import router as admin_router
 from app.api.routers.audit import router as audit_router
 from app.api.routers.auth import router as auth_router
 from app.api.routers.files import router as files_router
+from app.api.routers.governance import router as governance_router
 from app.api.routers.search import router as search_router
 from app.api.routers.shares import router as shares_router
 from app.api.routers.transfers import router as transfers_router
 from app.api.routers.user import router as user_router
 from app.api.routers.webauthn import router as webauthn_router
-from app.api.routers.governance import router as governance_router
 
 router = APIRouter()
 

@@ -33,8 +33,8 @@ from app.models.user import (
 
 __all__ = [
     "AdminStorageAllocation",
-    "AuditOutbox",
     "AuditChainAnchor",
+    "AuditOutbox",
     "Backup",
     "BackupManifest",
     "Base",
@@ -44,8 +44,8 @@ __all__ = [
     "GuestDropboxUpload",
     "IndexEntry",
     "LegalHold",
-    "RefreshToken",
     "RecoveryPolicy",
+    "RefreshToken",
     "Role",
     "SharedLink",
     "SharedLinkAttempt",
