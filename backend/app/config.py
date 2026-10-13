@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     # Soft-deleted files keep their ciphertext for this many days before the
     # trash reaper permanently removes blob + row.
     trash_retention_days: int = Field(30, alias="TRASH_RETENTION_DAYS", ge=1, le=3650)
+    recovery_rpo_minutes: int = Field(1440, alias="RECOVERY_RPO_MINUTES", ge=1)
+    recovery_rto_minutes: int = Field(240, alias="RECOVERY_RTO_MINUTES", ge=1)
+    data_residency_region: str | None = Field(None, alias="DATA_RESIDENCY_REGION")
+    # The server stores and returns only authenticated ciphertext envelopes.
+    # There is intentionally no mode that accepts plaintext vault keys.
+    key_bundle_mode: str = Field("server-blind-envelope", alias="KEY_BUNDLE_MODE")
 
     # --- CORS ---
     allowed_origins: str = Field("http://localhost:3000", alias="ALLOWED_ORIGINS")
@@ -90,6 +96,9 @@ class Settings(BaseSettings):
     rate_limit_rate: float = Field(100.0, alias="RATE_LIMIT_RATE", ge=0.1)
     rate_limit_capacity: int = Field(200, alias="RATE_LIMIT_CAPACITY", ge=1)
     rate_limit_max_buckets: int = Field(50_000, alias="RATE_LIMIT_MAX_BUCKETS", ge=100)
+    rate_limit_redis_url: str | None = Field(default=None, alias="RATE_LIMIT_REDIS_URL")
+    rate_limit_redis_timeout_seconds: float = Field(0.15, alias="RATE_LIMIT_REDIS_TIMEOUT_SECONDS", gt=0, le=5)
+    metrics_enabled: bool = Field(True, alias="METRICS_ENABLED")
 
     # --- Login throttling ---
     login_max_attempts: int = Field(5, alias="LOGIN_MAX_ATTEMPTS", ge=1, le=100)
@@ -185,6 +194,15 @@ class Settings(BaseSettings):
                 extra={"fields": weak, "environment": self.app_env},
             )
         return self
+
+    @field_validator("key_bundle_mode")
+    @classmethod
+    def _validate_key_bundle_mode(cls, value: str) -> str:
+        if value != "server-blind-envelope":
+            raise ValueError(
+                "KEY_BUNDLE_MODE must be server-blind-envelope; plaintext key transport is unsupported"
+            )
+        return value
 
     @property
     def database_url(self) -> str:

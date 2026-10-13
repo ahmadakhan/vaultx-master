@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AuthenticationError, AuthorizationError
+from app.core.permissions import Permission, role_allows
 from app.core.security import ACCESS_TOKEN_TYPE, decode_token, hash_token_identifier
 from app.core.tenant import set_tenant_context
 from app.db import get_db
@@ -85,6 +86,7 @@ async def get_current_user(
 
 async def get_current_admin(
     current_user: Annotated[User, Depends(get_current_user)],
+    token: Annotated[str, Depends(oauth2_scheme)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> User:
     """Return the current user if they have the admin role.
@@ -97,13 +99,39 @@ async def get_current_admin(
     """
     result = await db.execute(select(UserRole).where(UserRole.user_id == current_user.id))
     roles = result.scalars().all()
-    if not any(r.role == "admin" for r in roles):
+    if not any(role_allows(r.role, Permission.ADMIN_ACCESS) for r in roles):
         raise AuthorizationError("Admin access required")
+    # Privileged identities must have a second factor before they can reach
+    # any admin API.  This deliberately fails closed for legacy/bootstrap
+    # admins until they enroll MFA.
+    if not current_user.mfa_enabled:
+        raise AuthorizationError("Administrator MFA enrollment is required")
+    try:
+        token_payload = decode_token(token, expected_type=ACCESS_TOKEN_TYPE)
+    except ValueError as exc:
+        raise AuthenticationError("Recent MFA verification required for admin access") from exc
+    if not valid_mfa_claim(token_payload, recent=True):
+        raise AuthenticationError("Recent MFA verification required for admin access")
     return current_user
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
 CurrentAdmin = Annotated[User, Depends(get_current_admin)]
+
+
+def require_permission(permission: Permission):
+    """Build a dependency for a named capability without changing API paths."""
+
+    async def _dependency(
+        current_user: Annotated[User, Depends(get_current_user)],
+        db: Annotated[AsyncSession, Depends(get_db)],
+    ) -> User:
+        rows = await db.scalars(select(UserRole.role).where(UserRole.user_id == current_user.id))
+        if not any(role_allows(role, permission) for role in rows):
+            raise AuthorizationError(f"Permission required: {permission.value}")
+        return current_user
+
+    return _dependency
 
 
 def valid_mfa_claim(payload: dict[str, Any], *, recent: bool = False) -> bool:

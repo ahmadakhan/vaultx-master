@@ -4,17 +4,32 @@ services:
     container_name: vaultx_db
     restart: always
     environment:
-      POSTGRES_USER: vaultx_user
-      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
+      POSTGRES_USER: ${DB_MIGRATION_USER:?DB_MIGRATION_USER must be set}
+      POSTGRES_PASSWORD: ${DB_MIGRATION_PASSWORD:?DB_MIGRATION_PASSWORD must be set}
       POSTGRES_DB: vaultx
+      DB_RUNTIME_USER: ${DB_RUNTIME_USER:?DB_RUNTIME_USER must be set}
+      DB_RUNTIME_PASSWORD: ${DB_RUNTIME_PASSWORD:?DB_RUNTIME_PASSWORD must be set}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/10-create-runtime-user.sh:/docker-entrypoint-initdb.d/10-create-runtime-user.sh:ro
     networks:
       - vaultx_net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U vaultx_user -d vaultx"]
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    container_name: vaultx_redis
+    restart: unless-stopped
+    networks:
+      - vaultx_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
       retries: 12
 
   backend:
@@ -34,8 +49,8 @@ services:
       DB_HOST: db
       DB_PORT: 5432
       DB_NAME: vaultx
-      DB_USER: vaultx_user
-      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
+      DB_USER: ${DB_RUNTIME_USER:?DB_RUNTIME_USER must be set}
+      DB_PASSWORD: ${DB_RUNTIME_PASSWORD:?DB_RUNTIME_PASSWORD must be set}
       DB_SSL_MODE: disable
       MAIL_HOST: smtp.gmail.com
       MAIL_PORT: 587
@@ -63,9 +78,15 @@ services:
       AUDIT_SIGN_KEYS_DIR: /etc/vaultx/signing_keys
       SECURITY_HEADERS_ENABLED: "true"
       ENABLE_MONITORING: "true"
+      # Redis is optional; when unset the bounded per-worker limiter is used.
+      RATE_LIMIT_REDIS_URL: redis://redis:6379/0
+      RATE_LIMIT_REDIS_TIMEOUT_SECONDS: 0.15
+      METRICS_ENABLED: "true"
     depends_on:
       migrate:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     networks:
       - vaultx_net
     volumes:
@@ -74,7 +95,7 @@ services:
       - vaultx_storage:/var/vaultx/storage
       - vaultx_logs:/var/vaultx/logs
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3)"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -91,8 +112,8 @@ services:
       DB_HOST: db
       DB_PORT: 5432
       DB_NAME: vaultx
-      DB_USER: vaultx_user
-      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
+      DB_USER: ${DB_MIGRATION_USER:?DB_MIGRATION_USER must be set}
+      DB_PASSWORD: ${DB_MIGRATION_PASSWORD:?DB_MIGRATION_PASSWORD must be set}
       MAIL_HOST: smtp.gmail.com
       MAIL_USERNAME: noreply
       MAIL_PASSWORD: ${MAIL_PASSWORD:?MAIL_PASSWORD must be set}

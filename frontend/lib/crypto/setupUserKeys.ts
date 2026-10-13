@@ -163,13 +163,12 @@ export async function decryptWithMasterKey(
   );
 }
 
-export async function setupUserKeys(userId: string): Promise<UserKeys> {
-  // The registration helper receives the password directly; the legacy
-  // session helper may instead provide it by user id.
-  const password = memorySession.getItem(`vaultx_password_${userId}`) ?? userId;
+export async function setupUserKeys(password: string): Promise<UserKeys> {
+  if (!password) throw new Error("A vault password is required to create a key bundle")
   
-  const passwordSalt = memorySession.getItem(`vaultx_password_salt_${userId}`);
-  const masterKeyResponse = await deriveMasterKey(password, passwordSalt ?? undefined, CURRENT_ACCOUNT_PBKDF2_ITERATIONS);
+  // Registration creates a fresh salt. Login derives from the salt carried by
+  // the server-returned envelope in ``unlockUserKeyBundle``.
+  const masterKeyResponse = await deriveMasterKey(password, undefined, CURRENT_ACCOUNT_PBKDF2_ITERATIONS);
   
   const masterKey = masterKeyResponse.key;
   const masterPlain = crypto.getRandomValues(new Uint8Array(32));
@@ -194,8 +193,8 @@ export async function setupUserKeys(userId: string): Promise<UserKeys> {
   };
 }
 
-export async function prepareUserKeyBundle(userId: string): Promise<UserKeysResponse> {
-  const keys = await setupUserKeys(userId);
+export async function prepareUserKeyBundle(password: string): Promise<UserKeysResponse> {
+  const keys = await setupUserKeys(password);
   return {
     ...keys,
     kdf_iterations: keys.kdf_iterations,
@@ -230,12 +229,8 @@ export function clearUserKeys(userId: string): void {
   memorySession.removeItem(`vaultx_password_salt_${userId}`);
 }
 
-export async function createUserSession(userId: string): Promise<UserKeys> {
-  // Generate password if not exists
-  if (!memorySession.getItem(`vaultx_password_${userId}`)) {
-    const tempPassword = Array.from({ length: 32 }, () => Math.floor(Math.random() * 36).toString(36)).join('');
-    memorySession.setItem(`vaultx_password_${userId}`, tempPassword);
-  }
-  
-  return await setupUserKeys(userId);
+export async function createUserSession(userId: string, password?: string): Promise<UserKeys> {
+  void userId // retained for callers during the migration; identity never derives a password
+  if (!password) throw new Error("A vault password is required to create a key bundle")
+  return await setupUserKeys(password);
 }

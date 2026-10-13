@@ -6,7 +6,8 @@ Creates and configures the FastAPI application with:
 - Rate limiting middleware.
 - Structured JSON logging.
 - Global exception handlers for all custom exception types.
-- Database initialization during startup.
+- Database connectivity checks for readiness; schema changes run in the
+  dedicated deployment migration job.
 
 Usage::
 
@@ -27,7 +28,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import text
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -38,10 +39,13 @@ from app.core.logging import get_logger, setup_logging
 from app.core.security import hash_password
 from app.core.webauthn import verify_dependency as verify_webauthn_dependency
 from app.db import AsyncSessionLocal, engine
-from app.middleware import RateLimitMiddleware, SecurityHeadersMiddleware
-from app.migrations import apply_migrations
+from app.middleware import (
+    ObservabilityMiddleware,
+    RateLimitMiddleware,
+    SecurityHeadersMiddleware,
+    prometheus,
+)
 from app.models import (
-    Base,
     Role,
     Tenant,
     TenantQuota,
@@ -104,53 +108,6 @@ def _register_exception_handlers(app: FastAPI) -> None:
             status_code=500,
             content={"detail": "Internal server error. Please try again later."},
         )
-
-
-def _ensure_schema_columns(sync_conn: Any) -> None:
-    """Lightweight forward migration for columns added after first release.
-
-    ``create_all`` only creates missing *tables*; it never alters existing
-    ones, so columns introduced later (e.g. ``files.deleted_at`` for the
-    trash retention window) must be added explicitly.
-
-    Args:
-        sync_conn: Synchronous SQLAlchemy connection used by ``run_sync``.
-    """
-    from sqlalchemy import inspect as sa_inspect
-
-    inspector = sa_inspect(sync_conn)
-    if "files" in inspector.get_table_names():
-        columns = {c["name"] for c in inspector.get_columns("files")}
-        if "deleted_at" not in columns:
-            sync_conn.execute(text("ALTER TABLE files ADD COLUMN deleted_at TIMESTAMP"))
-            logger.info("Applied schema migration: files.deleted_at")
-    # Compatibility columns for databases created before the tenant foundation
-    # migration. PostgreSQL deployments should run migrations/phase3_4_rls.sql
-    # to also install RLS policies and perform the controlled backfill.
-    # PostgreSQL gets the correctly typed UUID columns and foreign keys from
-    # phase3_4_rls.sql; adding VARCHAR columns here would make that migration
-    # silently incompatible with an older installation.
-    if sync_conn.dialect.name != "postgresql":
-        for table in ("files", "index_entries", "file_shares", "shared_links"):
-            if table in inspector.get_table_names():
-                columns = {c["name"] for c in inspector.get_columns(table)}
-                if "tenant_id" not in columns:
-                    sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN tenant_id VARCHAR(36)"))
-                    logger.info("Applied schema migration: %s.tenant_id", table)
-    if "guest_dropbox_uploads" in inspector.get_table_names():
-        columns = {c["name"] for c in inspector.get_columns("guest_dropbox_uploads")}
-        if "status" not in columns:
-            sync_conn.execute(text("ALTER TABLE guest_dropbox_uploads ADD COLUMN status VARCHAR DEFAULT 'pending' NOT NULL"))
-        if "file_id" not in columns:
-            sync_conn.execute(text("ALTER TABLE guest_dropbox_uploads ADD COLUMN file_id VARCHAR"))
-        if "published_at" not in columns:
-            sync_conn.execute(text("ALTER TABLE guest_dropbox_uploads ADD COLUMN published_at TIMESTAMP"))
-        if "reconciliation_state" not in columns:
-            sync_conn.execute(text("ALTER TABLE guest_dropbox_uploads ADD COLUMN reconciliation_state VARCHAR DEFAULT 'staged' NOT NULL"))
-    if "tenant_quotas" in inspector.get_table_names():
-        columns = {c["name"] for c in inspector.get_columns("tenant_quotas")}
-        if "pending_upload_bytes" not in columns:
-            sync_conn.execute(text("ALTER TABLE tenant_quotas ADD COLUMN pending_upload_bytes BIGINT DEFAULT 0 NOT NULL"))
 
 
 async def _trash_reaper_loop() -> None:
@@ -231,11 +188,14 @@ async def seed_bootstrap_admin(
     email: str | None = None,
     password: str | None = None,
 ) -> bool:
-    """Create or update an optional bootstrap admin account.
+    """Create an optional bootstrap admin account exactly once.
 
     This is intentionally disabled unless one of the supported admin bootstrap
     environment variables is configured, so ordinary public registration still
-    remains non-admin by default.
+    remains non-admin by default.  Existing accounts are never reactivated,
+    re-keyed, or have their passwords changed during application startup.
+    Credential rotation and vault-key migration require an explicit operation
+    with its own backup and rollback procedure.
     """
     admin_email = normalize_email((email or settings.bootstrap_admin_email or "").strip())
     admin_password = (
@@ -275,37 +235,39 @@ async def seed_bootstrap_admin(
 
     result = await session.execute(_select(User).where(email_matches(User.email, admin_email)))
     user = result.scalar_one_or_none()
-    roles = {"user", "admin"}
-    if user is None:
-        tenant = Tenant(tenant_id=str(secrets.token_urlsafe(18)), name=f"{admin_email}'s Vault")
-        session.add(tenant)
-        await session.flush()
-        from app.core.tenant import set_tenant_context
-
-        await set_tenant_context(session, tenant.id)
-        session.add(TenantQuota(tenant_id=tenant.id, storage_quota_bytes=tenant.storage_quota_bytes))
-        user = User(
-            email=admin_email,
-            password_hash=hash_password(admin_password),
-            tenant_id=tenant.id,
-            # Temporary non-null placeholders are replaced by the generated
-            # client-decryptable bundle below before commit.
-            password_salt_b64=b"",
-            enc_master_key_b64=b"",
-            enc_master_key_iv=b"",
-            enc_search_key_b64=b"",
-            enc_search_key_iv=b"",
-            enc_private_key_b64=b"",
-            enc_private_key_iv=b"",
-            public_key_b64=b"",
-            is_active=True,
+    if user is not None:
+        logger.info(
+            "Bootstrap admin already exists; startup will not modify credentials or vault keys",
+            extra={"email": admin_email},
         )
-        session.add(user)
-        await session.flush()
-        roles = {"user", "admin"}
-    else:
-        user.is_active = True
-        user.password_hash = hash_password(admin_password)
+        return False
+
+    roles = {"user", "admin"}
+    tenant = Tenant(tenant_id=str(secrets.token_urlsafe(18)), name=f"{admin_email}'s Vault")
+    session.add(tenant)
+    await session.flush()
+    from app.core.tenant import set_tenant_context
+
+    await set_tenant_context(session, tenant.id)
+    session.add(TenantQuota(tenant_id=tenant.id, storage_quota_bytes=tenant.storage_quota_bytes))
+    user = User(
+        email=admin_email,
+        password_hash=hash_password(admin_password),
+        tenant_id=tenant.id,
+        # Temporary non-null placeholders are replaced by the generated
+        # client-decryptable bundle below before commit.
+        password_salt_b64=b"",
+        enc_master_key_b64=b"",
+        enc_master_key_iv=b"",
+        enc_search_key_b64=b"",
+        enc_search_key_iv=b"",
+        enc_private_key_b64=b"",
+        enc_private_key_iv=b"",
+        public_key_b64=b"",
+        is_active=True,
+    )
+    session.add(user)
+    await session.flush()
 
     salt = secrets.token_bytes(16)
     _derive_password_key(admin_password, salt)
@@ -370,11 +332,6 @@ def _create_lifespan() -> Any:
         except RuntimeError as exc:
             logger.critical("WebAuthn runtime dependency check failed: %s", exc)
             raise RuntimeError(f"VaultX cannot start: {exc}") from exc
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-            await conn.run_sync(_ensure_schema_columns)
-            await apply_migrations(conn)
-            logger.info("Database tables checked/created")
 
         # Seed default roles if they don't exist
         from sqlalchemy import select as _select
@@ -445,7 +402,11 @@ def create_app() -> FastAPI:
         RateLimitMiddleware,
         rate=settings.rate_limit_rate,
         capacity=settings.rate_limit_capacity,
+        max_buckets=settings.rate_limit_max_buckets,
+        redis_url=settings.rate_limit_redis_url,
+        redis_timeout_seconds=settings.rate_limit_redis_timeout_seconds,
     )
+    app.add_middleware(ObservabilityMiddleware)
     app.add_middleware(RequestLoggingMiddleware)
 
     app.add_middleware(
@@ -461,26 +422,41 @@ def create_app() -> FastAPI:
     _register_exception_handlers(app)
     app.include_router(api_router)
 
-    @app.get("/health")
-    async def health() -> dict[str, Any]:
-        """Health check endpoint.
+    @app.get("/health/live")
+    async def liveness() -> dict[str, str]:
+        """Report that the process is running without requiring dependencies."""
+        return {"status": "ok"}
 
-        Returns the application status, database connectivity, and
-        environment without exposing sensitive configuration.
-        """
-        db_status = "ok"
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics() -> Response:
+        if not settings.metrics_enabled:
+            return Response(status_code=404)
+        return Response(prometheus(), media_type="text/plain; version=0.0.4")
+
+    async def _database_ready() -> bool:
         try:
             async with AsyncSessionLocal() as session:
                 await session.execute(text("SELECT 1"))
         except Exception:
             logger.error("Database health check failed")
-            db_status = "unreachable"
+            return False
+        return True
 
+    @app.get("/health/ready")
+    async def readiness(response: Response) -> dict[str, Any]:
+        """Report whether the API can serve requests backed by its database."""
+        db_ready = await _database_ready()
+        response.status_code = 200 if db_ready else 503
         return {
-            "status": "ok" if db_status == "ok" else "degraded",
-            "database": db_status,
+            "status": "ok" if db_ready else "degraded",
+            "database": "ok" if db_ready else "unreachable",
             "environment": settings.app_env,
         }
+
+    @app.get("/health")
+    async def health(response: Response) -> dict[str, Any]:
+        """Backward-compatible alias for the dependency-aware readiness check."""
+        return await readiness(response)
 
     return app
 

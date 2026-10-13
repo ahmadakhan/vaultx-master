@@ -16,6 +16,23 @@ jobs:
   backend:
     name: Backend tests and lint
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PG_RLS_TEST_DATABASE_URL: postgresql+asyncpg://rls_runtime:rls_runtime_password@127.0.0.1:5432/rls_test
+      REQUIRE_PG_RLS_TESTS: '1'
     defaults:
       run:
         working-directory: backend
@@ -28,6 +45,14 @@ jobs:
           cache-dependency-path: backend/pyproject.toml
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[dev]'
+      - name: Create constrained RLS test database
+        env:
+          PGPASSWORD: postgres
+        run: >-
+          psql --host 127.0.0.1 --username postgres --dbname postgres
+          --command "CREATE ROLE rls_runtime LOGIN PASSWORD 'rls_runtime_password' NOSUPERUSER NOBYPASSRLS;"
+          && psql --host 127.0.0.1 --username postgres --dbname postgres
+          --command "CREATE DATABASE rls_test OWNER rls_runtime;"
       - run: ruff check app tests
       - run: pytest -q
 

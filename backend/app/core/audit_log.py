@@ -32,8 +32,9 @@ from app.config import settings
 from app.core.exceptions import DatabaseError
 from app.core.logging import get_logger
 from app.core.net import client_ip_from_scope
+from app.core.recovery import canonical_json
 from app.core.server_keys import SERVER_PRIVATE_KEY
-from app.models import AuditChainAnchor, TamperLog, User
+from app.models import AuditChainAnchor, AuditOutbox, TamperLog, User
 
 logger = get_logger(__name__)
 
@@ -198,6 +199,14 @@ async def record_audit_log(
             continue
 
         await db.refresh(entry)
+
+        # The outbox is an append-only delivery boundary.  A worker or external
+        # sink can claim undelivered rows; this process never assumes one exists.
+        outbox_payload = {"tamper_log_id": entry.id, "entry_hash": entry.entry_hash,
+                          "entry": entry.entry_json}
+        db.add(AuditOutbox(event_json=outbox_payload,
+                           event_hash=hashlib.sha256(canonical_json(outbox_payload)).hexdigest()))
+        await db.commit()
 
         logger.info(
             "Audit log recorded",

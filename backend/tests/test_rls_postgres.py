@@ -1,8 +1,8 @@
 """PostgreSQL integration coverage for the phase 3/4 tenant policies.
 
-This suite intentionally skips when a PostgreSQL test database is not
-configured. SQLite cannot exercise PostgreSQL RLS, so a skipped test includes
-the exact reason rather than silently providing false confidence.
+This suite is opt-in locally, but CI sets ``REQUIRE_PG_RLS_TESTS=1`` so a
+missing or unavailable PostgreSQL test database fails the job instead of
+silently removing RLS evidence. SQLite cannot exercise PostgreSQL RLS.
 """
 
 from __future__ import annotations
@@ -25,13 +25,19 @@ def _database_url() -> str:
     # disposable PostgreSQL URL.
     value = os.environ.get("PG_RLS_TEST_DATABASE_URL", "").strip()
     if not value:
-            pytest.skip("PostgreSQL RLS integration test skipped: PG_RLS_TEST_DATABASE_URL is not set")
+        _configuration_error("PG_RLS_TEST_DATABASE_URL is not set")
     if not value.startswith(("postgresql://", "postgresql+asyncpg://")):
-        pytest.skip(
-            "PostgreSQL RLS integration test skipped: PG_RLS_TEST_DATABASE_URL must use PostgreSQL "
-            "(SQLite cannot enforce RLS)"
+        _configuration_error(
+            "PG_RLS_TEST_DATABASE_URL must use PostgreSQL (SQLite cannot enforce RLS)"
         )
     return value.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+
+def _configuration_error(reason: str) -> None:
+    message = f"PostgreSQL RLS integration test unavailable: {reason}"
+    if os.environ.get("REQUIRE_PG_RLS_TESTS") == "1":
+        pytest.fail(message)
+    pytest.skip(message)
 
 
 @pytest.mark.asyncio
@@ -46,10 +52,10 @@ async def test_phase3_4_rls_denies_cross_tenant_reads_and_writes() -> None:
     file_b = uuid.uuid4()
     migration = Path(__file__).parents[1] / "migrations" / "phase3_4_rls.sql"
 
+    schema = f"rls_test_{uuid.uuid4().hex}"
     try:
         async with engine.connect() as conn:
             transaction = await conn.begin()
-            schema = f"rls_test_{uuid.uuid4().hex}"
             await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
             await conn.execute(text(f'SET LOCAL search_path TO "{schema}"'))
             await conn.run_sync(Base.metadata.create_all)
@@ -93,21 +99,59 @@ async def test_phase3_4_rls_denies_cross_tenant_reads_and_writes() -> None:
                 )
             raw = await conn.get_raw_connection()
             await raw.driver_connection.execute(migration.read_text())
-
-            await conn.execute(text("SELECT set_config('app.tenant_id', :tenant, true)"), {"tenant": str(tenant_a)})
-            visible = await conn.execute(text("SELECT id FROM files ORDER BY id"))
-            assert [row[0] for row in visible] == [file_a]
-            with pytest.raises(Exception, match=r"row-level security|policy"):
-                await conn.execute(
-                    text(
-                        "INSERT INTO files (id, owner_id, tenant_id, file_iv, metadata_ciphertext, "
-                        "metadata_iv, deleted) VALUES (:id, :owner, :tenant, :iv, :metadata, :iv, false)"
-                    ),
-                    {"id": uuid.uuid4(), "owner": user_a, "tenant": tenant_b, "iv": b"x", "metadata": b"m"},
+            role = await conn.execute(
+                text(
+                    "SELECT rolsuper, rolbypassrls FROM pg_roles "
+                    "WHERE rolname = current_user"
                 )
-            await transaction.rollback()
-            await transaction.rollback()
+            )
+            assert role.one() == (False, False)
+            await transaction.commit()
+
+            async with conn.begin():
+                await conn.execute(text(f'SET LOCAL search_path TO "{schema}"'))
+                await conn.execute(
+                    text("SELECT set_config('app.tenant_id', :tenant, true)"),
+                    {"tenant": str(tenant_a)},
+                )
+                visible = await conn.execute(text("SELECT id FROM files ORDER BY id"))
+                assert [row[0] for row in visible] == [file_a]
+                with pytest.raises(Exception, match=r"row-level security|policy"):
+                    await conn.execute(
+                        text(
+                            "INSERT INTO files (id, owner_id, tenant_id, file_iv, metadata_ciphertext, "
+                            "metadata_iv, deleted) VALUES (:id, :owner, :tenant, :iv, :metadata, :iv, false)"
+                        ),
+                        {
+                            "id": uuid.uuid4(),
+                            "owner": user_a,
+                            "tenant": tenant_b,
+                            "iv": b"x",
+                            "metadata": b"m",
+                        },
+                    )
+
+        # The first transaction returned its connection to the pool with a
+        # tenant context set via SET LOCAL. A fresh transaction must not inherit
+        # that context, even when SQLAlchemy reuses the same physical session.
+        async with engine.connect() as reused_conn, reused_conn.begin():
+            await reused_conn.execute(text(f'SET LOCAL search_path TO "{schema}"'))
+            assert (
+                await reused_conn.execute(text("SELECT current_setting('app.tenant_id', true)"))
+            ).scalar_one() in (None, "")
+            assert (await reused_conn.execute(text("SELECT id FROM files"))).all() == []
+            await reused_conn.execute(
+                text("SELECT set_config('app.tenant_id', :tenant, true)"),
+                {"tenant": str(tenant_b)},
+            )
+            visible = await reused_conn.execute(text("SELECT id FROM files ORDER BY id"))
+            assert [row[0] for row in visible] == [file_b]
     except (OSError, OperationalError) as exc:
-        pytest.skip(f"PostgreSQL RLS integration test skipped: test database unavailable ({exc})")
+        _configuration_error(f"test database unavailable ({exc})")
     finally:
+        try:
+            async with engine.begin() as cleanup_conn:
+                await cleanup_conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        except (OSError, OperationalError):
+            pass
         await engine.dispose()

@@ -20,6 +20,7 @@ dependencies = [
     "pyotp>=2.9.0",
     "qrcode[pil]>=8.2",
     "requests>=2.32.5",
+    "redis>=6.4.0",
     "sqlalchemy[asyncio]>=2.0.44",
     "webauthn>=2.8.0,<3",
 ]

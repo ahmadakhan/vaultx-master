@@ -7,3 +7,4 @@ backend/test_storage/
 **/.pytest_cache/
 **/.mypy_cache/
 **/.ruff_cache/
+.tools/

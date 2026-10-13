@@ -15,11 +15,13 @@ the header could be spoofed to obtain an unlimited number of fresh buckets.
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.config import settings
 from app.core.net import IPNetwork, client_ip_from_scope
+from app.middleware.observability import increment
 
 
 class _TokenBucket:
@@ -69,6 +71,8 @@ class RateLimitMiddleware:
         max_buckets: int = 50_000,
         idle_seconds: float = 300.0,
         trusted_networks: tuple[IPNetwork, ...] | None = None,
+        redis_url: str | None = None,
+        redis_timeout_seconds: float = 0.15,
     ) -> None:
         self.app = app
         self.rate = rate
@@ -79,6 +83,10 @@ class RateLimitMiddleware:
             settings.trusted_proxy_networks if trusted_networks is None else trusted_networks
         )
         self._buckets: dict[str, _TokenBucket] = {}
+        self._redis: Any = None
+        self._redis_url = redis_url
+        self._redis_timeout = redis_timeout_seconds
+        self._redis_failed = False
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -86,11 +94,32 @@ class RateLimitMiddleware:
             return
 
         client_ip = client_ip_from_scope(scope, self.trusted_networks)
-        if client_ip and not self._bucket(client_ip).consume():
+        allowed = await self._allow(client_ip) if client_ip else True
+        if client_ip and not allowed:
             await self._reject(send)
             return
 
         await self.app(scope, receive, send)
+
+    async def _allow(self, key: str) -> bool:
+        if self._redis_url and not self._redis_failed:
+            try:
+                if self._redis is None:
+                    from redis.asyncio import Redis
+                    self._redis = Redis.from_url(self._redis_url, socket_timeout=self._redis_timeout,
+                                                 decode_responses=False)
+                redis_key = f"vaultx:ratelimit:{key}"
+                count = await self._redis.incr(redis_key)
+                if count == 1:
+                    await self._redis.expire(redis_key, max(1, int(self.capacity / self.rate)))
+                increment("rate_limit_redis_requests_total")
+                return count <= self.capacity
+            except Exception:
+                self._redis_failed = True
+                increment("rate_limit_redis_failures_total")
+                increment("rate_limit_fallback_total")
+                self._redis = None
+        return self._bucket(key).consume()
 
     def _bucket(self, key: str) -> _TokenBucket:
         """Return the bucket for ``key``, creating it within a bounded map."""
