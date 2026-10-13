@@ -36,9 +36,20 @@ from app.config import settings
 from app.core.exceptions import VaultXError, get_exception_handler
 from app.core.logging import get_logger, setup_logging
 from app.core.security import hash_password
+from app.core.webauthn import verify_dependency as verify_webauthn_dependency
 from app.db import AsyncSessionLocal, engine
 from app.middleware import RateLimitMiddleware, SecurityHeadersMiddleware
-from app.models import Base, Role, User, UserRole, email_matches, normalize_email
+from app.migrations import apply_migrations
+from app.models import (
+    Base,
+    Role,
+    Tenant,
+    TenantQuota,
+    User,
+    UserRole,
+    email_matches,
+    normalize_email,
+)
 
 logger = get_logger(__name__)
 
@@ -113,6 +124,33 @@ def _ensure_schema_columns(sync_conn: Any) -> None:
         if "deleted_at" not in columns:
             sync_conn.execute(text("ALTER TABLE files ADD COLUMN deleted_at TIMESTAMP"))
             logger.info("Applied schema migration: files.deleted_at")
+    # Compatibility columns for databases created before the tenant foundation
+    # migration. PostgreSQL deployments should run migrations/phase3_4_rls.sql
+    # to also install RLS policies and perform the controlled backfill.
+    # PostgreSQL gets the correctly typed UUID columns and foreign keys from
+    # phase3_4_rls.sql; adding VARCHAR columns here would make that migration
+    # silently incompatible with an older installation.
+    if sync_conn.dialect.name != "postgresql":
+        for table in ("files", "index_entries", "file_shares", "shared_links"):
+            if table in inspector.get_table_names():
+                columns = {c["name"] for c in inspector.get_columns(table)}
+                if "tenant_id" not in columns:
+                    sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN tenant_id VARCHAR(36)"))
+                    logger.info("Applied schema migration: %s.tenant_id", table)
+    if "guest_dropbox_uploads" in inspector.get_table_names():
+        columns = {c["name"] for c in inspector.get_columns("guest_dropbox_uploads")}
+        if "status" not in columns:
+            sync_conn.execute(text("ALTER TABLE guest_dropbox_uploads ADD COLUMN status VARCHAR DEFAULT 'pending' NOT NULL"))
+        if "file_id" not in columns:
+            sync_conn.execute(text("ALTER TABLE guest_dropbox_uploads ADD COLUMN file_id VARCHAR"))
+        if "published_at" not in columns:
+            sync_conn.execute(text("ALTER TABLE guest_dropbox_uploads ADD COLUMN published_at TIMESTAMP"))
+        if "reconciliation_state" not in columns:
+            sync_conn.execute(text("ALTER TABLE guest_dropbox_uploads ADD COLUMN reconciliation_state VARCHAR DEFAULT 'staged' NOT NULL"))
+    if "tenant_quotas" in inspector.get_table_names():
+        columns = {c["name"] for c in inspector.get_columns("tenant_quotas")}
+        if "pending_upload_bytes" not in columns:
+            sync_conn.execute(text("ALTER TABLE tenant_quotas ADD COLUMN pending_upload_bytes BIGINT DEFAULT 0 NOT NULL"))
 
 
 async def _trash_reaper_loop() -> None:
@@ -136,11 +174,14 @@ async def _trash_reaper_loop() -> None:
                 rows = (
                     (
                         await session.execute(
-                            sa_select(_File).where(
+                            sa_select(_File)
+                            .where(
                                 _File.deleted.is_(True),
                                 _File.deleted_at.is_not(None),
                                 _File.deleted_at <= cutoff,
-                            ).with_for_update(skip_locked=True).limit(100)
+                            )
+                            .with_for_update(skip_locked=True)
+                            .limit(100)
                         )
                     )
                     .scalars()
@@ -171,6 +212,19 @@ async def _trash_reaper_loop() -> None:
             logger.exception("Trash reaper iteration failed")
 
 
+async def _transfer_reaper_loop() -> None:
+    while True:
+        await asyncio.sleep(15 * 60)
+        try:
+            from app.core.transfer_reaper import reap_transfer_staging
+            async with AsyncSessionLocal() as session:
+                await reap_transfer_staging(session)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Transfer staging reaper iteration failed")
+
+
 async def seed_bootstrap_admin(
     session: Any,
     *,
@@ -184,7 +238,9 @@ async def seed_bootstrap_admin(
     remains non-admin by default.
     """
     admin_email = normalize_email((email or settings.bootstrap_admin_email or "").strip())
-    admin_password = (password if password is not None else settings.bootstrap_admin_password or "").strip()
+    admin_password = (
+        password if password is not None else settings.bootstrap_admin_password or ""
+    ).strip()
     if not admin_email or not admin_password:
         return False
 
@@ -209,7 +265,9 @@ async def seed_bootstrap_admin(
         )
         return kdf.derive(password.encode("utf-8"))
 
-    def _encrypt_bundle_value(value: bytes, *, role: str, password: str, salt: bytes) -> tuple[bytes, bytes]:
+    def _encrypt_bundle_value(
+        value: bytes, *, role: str, password: str, salt: bytes
+    ) -> tuple[bytes, bytes]:
         iv = secrets.token_bytes(12)
         key = _derive_password_key(password, salt)
         ciphertext = AESGCM(key).encrypt(iv, value, _bundle_aad(role))
@@ -219,9 +277,27 @@ async def seed_bootstrap_admin(
     user = result.scalar_one_or_none()
     roles = {"user", "admin"}
     if user is None:
+        tenant = Tenant(tenant_id=str(secrets.token_urlsafe(18)), name=f"{admin_email}'s Vault")
+        session.add(tenant)
+        await session.flush()
+        from app.core.tenant import set_tenant_context
+
+        await set_tenant_context(session, tenant.id)
+        session.add(TenantQuota(tenant_id=tenant.id, storage_quota_bytes=tenant.storage_quota_bytes))
         user = User(
             email=admin_email,
             password_hash=hash_password(admin_password),
+            tenant_id=tenant.id,
+            # Temporary non-null placeholders are replaced by the generated
+            # client-decryptable bundle below before commit.
+            password_salt_b64=b"",
+            enc_master_key_b64=b"",
+            enc_master_key_iv=b"",
+            enc_search_key_b64=b"",
+            enc_search_key_iv=b"",
+            enc_private_key_b64=b"",
+            enc_private_key_iv=b"",
+            public_key_b64=b"",
             is_active=True,
         )
         session.add(user)
@@ -232,7 +308,7 @@ async def seed_bootstrap_admin(
         user.password_hash = hash_password(admin_password)
 
     salt = secrets.token_bytes(16)
-    password_key = _derive_password_key(admin_password, salt)
+    _derive_password_key(admin_password, salt)
     key_pair = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     master_key = secrets.token_bytes(32)
     search_key = secrets.token_bytes(32)
@@ -289,9 +365,15 @@ def _create_lifespan() -> Any:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> Any:
+        try:
+            verify_webauthn_dependency()
+        except RuntimeError as exc:
+            logger.critical("WebAuthn runtime dependency check failed: %s", exc)
+            raise RuntimeError(f"VaultX cannot start: {exc}") from exc
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             await conn.run_sync(_ensure_schema_columns)
+            await apply_migrations(conn)
             logger.info("Database tables checked/created")
 
         # Seed default roles if they don't exist
@@ -318,12 +400,16 @@ def _create_lifespan() -> Any:
         )
 
         reaper_task = asyncio.create_task(_trash_reaper_loop())
+        transfer_reaper_task = asyncio.create_task(_transfer_reaper_loop())
 
         yield
 
         reaper_task.cancel()
+        transfer_reaper_task.cancel()
         with suppress(asyncio.CancelledError):
             await reaper_task
+        with suppress(asyncio.CancelledError):
+            await transfer_reaper_task
         await engine.dispose()
         logger.info("Database connection closed")
 

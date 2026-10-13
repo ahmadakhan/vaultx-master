@@ -35,6 +35,9 @@ class IndexEntry(Base):
         ForeignKey("users.id", ondelete="CASCADE"),
         primary_key=True,
     )
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     value: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     prev_token: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 

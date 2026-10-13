@@ -16,7 +16,7 @@ require.extensions[".ts"] = (module, filename) => {
 };
 const { bufToB64, b64ToBuf } = require("../lib/crypto/base.ts");
 const { aesEncryptArrayBuffer, aesDecryptArrayBuffer } = require("../lib/crypto/aes.ts");
-const { CHUNK_SIZE, buildChunkIv, decryptChunkedGCM } = require("../lib/crypto/chunking.ts");
+const { CHUNK_SIZE, buildChunkIv, decryptChunkedGCM, encryptChunkSecure, decryptChunkSecure } = require("../lib/crypto/chunking.ts");
 const { deriveMasterKey, generateFileKey } = require("../lib/crypto/keys.ts");
 const { prepareUserKeyBundle } = require("../lib/crypto/setupUserKeys.ts");
 const { unlockUserKeyBundle } = require("../lib/crypto/bundle.ts");
@@ -63,7 +63,13 @@ test("production 5MiB boundary and sliced IVs retain the actual encryption nonce
   assert.deepEqual(new Uint8Array(await aesDecryptArrayBuffer(sealed.ciphertext_b64, sealed.iv_b64, key)), new Uint8Array([1, 2, 3]));
 });
 
-test("v2 registration bundle unlocks and binds each key to its role", async () => {
+test("AES-GCM accepts string additionalData and preserves versioned bundle binding", async () => {
+  const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  const plain = new Uint8Array([1, 2, 3, 4, 5]);
+  const sealed = await aesEncryptArrayBuffer(plain.buffer, key, undefined, "vaultx:key-bundle:v2:master");
+  const recovered = new Uint8Array(await aesDecryptArrayBuffer(sealed.ciphertext_b64, sealed.iv_b64, key, "vaultx:key-bundle:v2:master"));
+  assert.deepEqual(recovered, plain);
+
   const bundle = await prepareUserKeyBundle("Synthetic Password 123!");
   assert.equal(bundle.key_bundle_version, 2);
   assert.equal(bundle.kdf_iterations, 600000);
@@ -76,6 +82,20 @@ test("v2 registration bundle unlocks and binds each key to its role", async () =
   await assert.rejects(unlockUserKeyBundle("wrong password", bundle));
   await assert.rejects(unlockUserKeyBundle("Synthetic Password 123!", { ...bundle, enc_master_key_b64: bundle.enc_search_key_b64, enc_master_key_iv: bundle.enc_search_key_iv }));
   await assert.rejects(unlockUserKeyBundle("Synthetic Password 123!", { ...bundle, key_bundle_version: 999 }), /version/);
+});
+
+test("versioned chunk format uses deterministic AAD and ciphertext||tag framing", async () => {
+  const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  const nonce = new Uint8Array(12).fill(7);
+  const plain = Uint8Array.from([1, 2, 3, 4]).buffer;
+  const options = { tenantId: "tenant-a" };
+  const first = await encryptChunkSecure(plain, key, nonce, 3, options);
+  const second = await encryptChunkSecure(plain, key, nonce, 3, options);
+  assert.equal(first.formatVersion, 1);
+  assert.equal(first.encryptedAt, 0);
+  assert.equal(first.ciphertext_b64, second.ciphertext_b64);
+  assert.deepEqual(new Uint8Array(await decryptChunkSecure(first, key, nonce)), new Uint8Array(plain));
+  await assert.rejects(decryptChunkSecure({ ...first, tenantId: "other" }, key, nonce));
 });
 
 test("legacy bundles retain the 150k PBKDF2 contract", async () => {

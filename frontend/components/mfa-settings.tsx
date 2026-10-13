@@ -134,14 +134,22 @@ export function MfaSettings() {
   return (
     <div className="space-y-6">
       <Card className="border-border bg-background/80 shadow-none">
-        <CardHeader className="space-y-2">
-          <div className="flex items-center gap-2 text-foreground">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-emerald-500/30 bg-emerald-500/5">
+        <CardHeader className="flex flex-col gap-4 pb-5 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-emerald-500/30 bg-emerald-500/5">
               <Shield className="h-4 w-4 text-emerald-600 dark:text-emerald-400" strokeWidth={1.8} />
             </div>
-            <CardTitle className="text-lg font-semibold">Two-Factor Authentication</CardTitle>
+            <div className="min-w-0 space-y-1">
+              <CardTitle className="text-lg font-semibold">Two-Factor Authentication</CardTitle>
+              <CardDescription className="text-sm text-muted-foreground">Protect your vault with a trusted authenticator or a passkey-bound device challenge.</CardDescription>
+            </div>
           </div>
-          <CardDescription className="text-sm text-muted-foreground">Protect your vault with a trusted authenticator or a passkey-bound device challenge.</CardDescription>
+          {!mfaEnabled && step !== "verify" && (
+            <Button onClick={() => void beginMfaSetup()} disabled={loading} className="min-h-11 w-full shrink-0 bg-primary text-primary-foreground hover:bg-primary/90 sm:w-auto">
+              {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <ShieldCheck className="mr-2 h-4 w-4" strokeWidth={1.8} />}
+              Set up MFA
+            </Button>
+          )}
         </CardHeader>
 
         <CardContent className="space-y-5">
@@ -219,14 +227,6 @@ export function MfaSettings() {
             </div>
           )}
 
-          {!mfaEnabled && step !== "verify" && (
-            <div className="space-y-3">
-              <Button onClick={() => void beginMfaSetup()} disabled={loading} className="min-h-11 w-full bg-primary text-primary-foreground hover:bg-primary/90">
-                {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <ShieldCheck className="mr-2 h-4 w-4" strokeWidth={1.8} />}
-                Set up MFA
-              </Button>
-            </div>
-          )}
         </CardContent>
       </Card>
 

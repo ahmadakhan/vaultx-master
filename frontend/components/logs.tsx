@@ -35,13 +35,23 @@ export function Logs() {
       const ctx = getVaultXContext();
       const data = await api.get("/audit/logs", ctx.accessToken);
       const rawLogs: RawLog[] = data.logs || [];
-      const parsedLogs = rawLogs.map((log) => ({
-        ...log,
-        entry:
-          typeof log.entry === "string"
-            ? JSON.parse(log.entry)
-            : log.entry || {},
-      }));
+      const parsedLogs = rawLogs.map((log) => {
+        const rawEntry = log.entry_json ?? log.entry ?? {};
+        let entry: Record<string, unknown> = {};
+        if (typeof rawEntry === "string") {
+          try {
+            const parsed: unknown = JSON.parse(rawEntry);
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+              entry = parsed as Record<string, unknown>;
+            }
+          } catch {
+            entry = {};
+          }
+        } else if (rawEntry && typeof rawEntry === "object" && !Array.isArray(rawEntry)) {
+          entry = rawEntry;
+        }
+        return { ...log, id: String(log.id), entry, prev_hash: log.prev_hash ?? "" };
+      });
       setLogs(parsedLogs);
     } catch (err) {
       console.error("Error fetching logs:", err);
@@ -172,13 +182,13 @@ export function Logs() {
                       className="grid grid-cols-4 px-4 py-3 text-sm hover:bg-accent/40 transition-colors"
                     >
                       <span className="text-primary font-medium truncate">
-                        {entry.action || "—"}
+                        {String(entry.action || "—")}
                       </span>
                       <span className="text-muted-foreground truncate">
-                        {entry.ip || "—"}
+                        {String(entry.ip || "—")}
                       </span>
                       <span className="text-muted-foreground truncate">
-                        {entry.user_agent || "—"}
+                        {String(entry.user_agent || "—")}
                       </span>
                       <span className="text-right text-muted-foreground">
                         {new Date(log.created_at).toLocaleString()}

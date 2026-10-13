@@ -78,7 +78,7 @@ export function getSessionContext(): VaultXContext | null {
 }
 
 export function getVaultXContext(): VaultXContext {
-  const ctx = getSessionContext()
+  const ctx = context ?? getSessionContext()
   if (!ctx) throw new Error("Session expired — please log in again. Reloading locks your vault.")
   
   // Check if context has expired
@@ -99,4 +99,3 @@ export function clearVaultXContext(): void {
 export function isAuthenticated(): boolean {
   return getSessionContext() !== null
 }
-

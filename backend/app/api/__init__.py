@@ -20,7 +20,9 @@ from app.api.routers.auth import router as auth_router
 from app.api.routers.files import router as files_router
 from app.api.routers.search import router as search_router
 from app.api.routers.shares import router as shares_router
+from app.api.routers.transfers import router as transfers_router
 from app.api.routers.user import router as user_router
+from app.api.routers.webauthn import router as webauthn_router
 
 router = APIRouter()
 
@@ -31,6 +33,8 @@ router.include_router(search_router)
 router.include_router(user_router)
 router.include_router(audit_router)
 router.include_router(admin_router)
+router.include_router(transfers_router)
+router.include_router(webauthn_router)
 
 __all__ = [
     "admin_router",
@@ -40,5 +44,7 @@ __all__ = [
     "router",
     "search_router",
     "shares_router",
+    "transfers_router",
     "user_router",
+    "webauthn_router",
 ]

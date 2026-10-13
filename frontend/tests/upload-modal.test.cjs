@@ -18,6 +18,25 @@ function harness({ importKey } = {}) {
   const slots = [];
   let cursor = 0;
   const requests = [], rawKeys = [], plaintext = [], alerts = [];
+  let server;
+  const request = (path, data, token, method) => { const pending = deferred(); requests.push({ path, data, token, method, ...pending }); return pending.promise; };
+  const api = {
+    post: (path, data, token) => {
+      if (path === "upload-sessions") {
+        server ||= { id: "session", ...data, offset: 0, status: "active" };
+        return Promise.resolve({ ...server });
+      }
+      return request(path, data, token, "POST");
+    },
+    patch: async (path, data, token) => {
+      await request(path, data, token, "PATCH");
+      server.offset += data.size;
+      if (server.offset === server.total_bytes) server.status = "complete";
+      return { ...server };
+    },
+    get: async () => ({ ...server }),
+    delete: async (path, token) => { await request(path, undefined, token, "DELETE"); server.status = "cancelled"; },
+  };
   const session = new Map([
     ["vaultx_access_token", "fixture"],
     ["vaultx_master_key", Buffer.alloc(32, 7).toString("base64")],
@@ -35,20 +54,23 @@ function harness({ importKey } = {}) {
     "@/lib/crypto/keys": { generateFileKey: async () => Buffer.alloc(32, 9).toString("base64") },
     "@/lib/crypto/chunking": { CHUNK_SIZE: 4, buildChunkIv: () => new Uint8Array(12) },
     "@/lib/crypto/aes": {
-      aesEncryptArrayBuffer: async (buffer, key, iv) => { if (iv) plaintext.push(buffer); return { ciphertext_b64: "AQ==", iv_b64: "AAAAAAAAAAAAAAAA" }; },
+      aesEncryptArrayBuffer: async (buffer, key, iv) => { if (iv) plaintext.push(buffer); return { ciphertext_b64: Buffer.alloc(buffer.byteLength + 16, 1).toString("base64"), iv_b64: "AAAAAAAAAAAAAAAA" }; },
       encryptStringWithAes: async () => ({ ciphertext_b64: "AQ==", iv_b64: "AAAAAAAAAAAAAAAA" }),
     },
     "@/lib/crypto/context": { memorySession: { getItem: k => session.get(k), setItem: (k, v) => session.set(k, v) } },
     "@/lib/types": { errorMessage: error => error.message },
-    "@/lib/api": { api: { post: (path, data) => { const pending = deferred(); requests.push({ path, data, ...pending }); return pending.promise; } } },
+    "@/lib/api": { api },
     mammoth: {},
   };
+  const helper = {};
+  vm.runInNewContext(ts.transpileModule(fs.readFileSync(require.resolve("../lib/resumable-upload.ts"), "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, { exports: helper, require: () => ({ api }) });
+  modules["@/lib/resumable-upload"] = helper;
   const source = fs.readFileSync(require.resolve("../components/upload-modal.tsx"), "utf8");
   const output = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX } }).outputText;
   const exports = {};
   vm.runInNewContext(output, {
     exports, require: name => modules[name] || new Proxy({}, { get: (_, key) => key }),
-    crypto: { randomUUID: () => webcrypto.randomUUID(), subtle: { importKey: async (_, raw) => { rawKeys.push(raw); return importKey ? importKey(rawKeys.length) : {}; } } },
+    crypto: { getRandomValues: bytes => webcrypto.getRandomValues(bytes), randomUUID: () => webcrypto.randomUUID(), subtle: { importKey: async (_, raw) => { rawKeys.push(raw); return importKey ? importKey(rawKeys.length) : {}; } } },
     Uint8Array, TextEncoder, FormData, Blob, atob, performance, alert: message => alerts.push(message),
   });
   function render() { cursor = 0; return exports.UploadModal({ open: true, onOpenChange() {} }); }
@@ -57,10 +79,9 @@ function harness({ importKey } = {}) {
     if (predicate(node.props || {})) return node.props;
     for (const child of [node.props?.children].flat(Infinity)) { if (child === undefined) continue; const match = find(predicate, child); if (match) return match; }
   }
-  async function add(name = "sample", size = 9) {
+  function add(name = "sample", size = 9) {
     const file = { name, size, type: "", slice: (start, end) => new Blob([new Uint8Array(end - start).fill(5)]) };
     find(p => p.onDrop).onDrop({ preventDefault() {}, stopPropagation() {}, dataTransfer: { files: [file] } });
-    await until(() => slots[0].every(item => item.status !== "preparing"));
   }
   return { add, find, requests, rawKeys, plaintext, alerts, files: () => slots[0] };
 }
@@ -72,14 +93,15 @@ async function until(predicate) {
 
 test("32-byte tokens, chunk-boundary pause, and locked resume preserve acknowledged cursor", async () => {
   const h = harness();
-  await h.add();
+  h.add();
+  await until(() => h.files()[0].status !== "preparing");
   h.find(p => p.placeholder).onChange({ target: { value: "sample" } });
   h.find(p => p.children === "Add").onClick();
   const done = h.find(p => p.children === "Start / resume queue").onClick;
   const running = done();
   await done(); // second click before rendering cannot start another worker
   await until(() => h.requests.length === 1);
-  const tokens = JSON.parse(h.requests[0].data.get("tokens_json"));
+   const tokens = JSON.parse(h.files()[0].tokens_json);
   assert.equal(Buffer.from(tokens[0].token, "base64").length, 32);
   h.find(p => p["aria-label"] === "Pause sample").onClick();
   assert.equal(h.files()[0].status, "pausing");
@@ -94,13 +116,17 @@ test("32-byte tokens, chunk-boundary pause, and locked resume preserve acknowled
   const resumed = resume();
   await resume();
   await until(() => h.requests.length === 2);
-  assert.equal(h.requests[1].data.get("chunk_index"), "1");
+  assert.equal(h.requests[1].data.size, 20);
   h.requests[1].resolve({});
   await until(() => h.requests.length === 3);
   h.requests[2].resolve({});
   await until(() => h.requests.length === 4);
-  assert.equal(h.requests[3].path, "/user/index_state");
+  assert.equal(h.requests[3].path, "upload-sessions/session/finalize");
+  assert.equal(h.requests[3].data.tokens[0].token, tokens[0].token);
   h.requests[3].resolve({});
+  await until(() => h.requests.length === 5);
+  assert.equal(h.requests[4].path, "/user/index_state");
+  h.requests[4].resolve({});
   await resumed;
   assert.equal(h.files()[0].status, "completed");
   assert.ok(h.rawKeys.every(bytes => bytes.every(value => value === 0)));
@@ -110,39 +136,54 @@ test("32-byte tokens, chunk-boundary pause, and locked resume preserve acknowled
 test("stop survives request success or failure without changing queued files", async () => {
   for (const fail of [false, true]) {
     const h = harness();
-    await h.add(); await h.add("queued");
+    h.add(); h.add("queued");
+    await until(() => h.files().every(item => item.status !== "preparing"));
     const running = h.find(p => p.children === "Start / resume queue").onClick();
     await until(() => h.requests.length === 1);
     h.find(p => p["aria-label"] === "Abort sample").onClick();
     if (fail) h.requests[0].reject(new Error("network failure"));
     else h.requests[0].resolve({});
+    await until(() => h.requests.length === 2);
+    assert.equal(h.requests[1].method, "DELETE");
+    assert.equal(h.requests[1].token, "fixture");
+    h.requests[1].resolve({});
     await running;
     assert.equal(h.files()[0].status, "stopped");
-    assert.equal(h.files()[0].uploadedBytes, 0);
+    assert.equal(h.files()[0].uploadedBytes, fail ? 0 : 4);
     assert.equal(h.files()[1].status, "pending");
-    assert.equal(h.requests.length, 1);
+    assert.equal(h.requests.length, 2);
     assert.ok(h.plaintext.every(buffer => new Uint8Array(buffer).every(value => value === 0)));
     assert.ok(h.rawKeys.every(bytes => bytes.every(value => value === 0)));
   }
 });
 
-test("stop during the final request keeps stopped state while publishing its search head", async () => {
-  const h = harness(); await h.add("sample", 1);
+test("cancel rejected after last frame remains retryable and does not claim cancellation", async () => {
+  const h = harness(); h.add("sample", 1);
+  await until(() => h.files()[0].status !== "preparing");
   const running = h.find(p => p.children === "Start / resume queue").onClick();
   await until(() => h.requests.length === 1);
   h.find(p => p["aria-label"] === "Abort sample").onClick();
   h.requests[0].resolve({});
   await until(() => h.requests.length === 2);
-  assert.equal(h.requests[1].path, "/user/index_state");
-  h.requests[1].resolve({});
+  assert.equal(h.requests[1].method, "DELETE");
+  h.requests[1].reject(new Error("Completed upload sessions cannot be cancelled"));
   await running;
-  assert.equal(h.files()[0].status, "stopped");
+  assert.equal(h.files()[0].status, "error");
+  const resumed = h.find(p => p["aria-label"] === "Resume sample").onClick();
+  await until(() => h.requests.length === 3);
+  assert.equal(h.requests[2].path, "upload-sessions/session/finalize");
+  h.requests[2].resolve({});
+  await until(() => h.requests.length === 4);
+  h.requests[3].resolve({});
+  await resumed;
+  assert.equal(h.files()[0].status, "completed");
 });
 
 test("stop during preparation prevents the first request and wipes raw keys", async () => {
   const preparation = deferred();
   const h = harness({ importKey: count => count === 2 ? preparation.promise : {} });
-  await h.add();
+  h.add();
+  await until(() => h.files()[0].status !== "preparing");
   const running = h.find(p => p.children === "Start / resume queue").onClick();
   await until(() => h.rawKeys.length === 2);
   h.find(p => p["aria-label"] === "Abort sample").onClick();
@@ -155,7 +196,8 @@ test("stop during preparation prevents the first request and wipes raw keys", as
 
 test("failed key imports wipe owned bytes and only fail the active file", async () => {
   const h = harness({ importKey: count => { if (count === 3) throw new Error("import failed"); return {}; } });
-  await h.add(); await h.add("queued");
+  h.add(); h.add("queued");
+  await until(() => h.files().every(item => item.status !== "preparing"));
   await h.find(p => p.children === "Start / resume queue").onClick();
   assert.equal(h.files()[0].status, "error");
   assert.equal(h.files()[1].status, "pending");

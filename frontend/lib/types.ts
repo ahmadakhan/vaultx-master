@@ -26,10 +26,11 @@ export interface RawFile {
 }
 
 export interface RawLog {
-  id: string
-  entry: Record<string, unknown> | string
+  id: number | string
+  entry_json?: Record<string, unknown> | string
+  entry?: Record<string, unknown> | string
   entry_hash: string
-  prev_hash: string
+  prev_hash?: string | null
   created_at: string
 }
 

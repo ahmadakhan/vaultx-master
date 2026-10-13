@@ -1,4 +1,5 @@
 """Bounded, owner-scoped filesystem staging with non-overwriting publication."""
+
 from __future__ import annotations
 
 import fcntl
@@ -17,6 +18,7 @@ class FileSystemStorage:
     def __init__(self, root: str | None = None) -> None:
         if root is None:
             from app.config import settings
+
             root = settings.storage_dir
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -64,9 +66,17 @@ class FileSystemStorage:
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
-    def write_chunk(self, upload_id: str, chunk_index: int, total_chunks: int,
-                    data: bytes | BinaryIO, is_last: bool, *, max_bytes: int = 11_000_000_000,
-                    metadata: dict | None = None) -> bool:
+    def write_chunk(
+        self,
+        upload_id: str,
+        chunk_index: int,
+        total_chunks: int,
+        data: bytes | BinaryIO,
+        is_last: bool,
+        *,
+        max_bytes: int = 11_000_000_000,
+        metadata: dict | None = None,
+    ) -> bool:
         if not 1 <= total_chunks <= 10000 or not 0 <= chunk_index < total_chunks:
             raise ValidationError("Invalid chunk sequence")
         if is_last and chunk_index != total_chunks - 1:
@@ -77,8 +87,12 @@ class FileSystemStorage:
         if meta_path.exists():
             manifest = json.loads(meta_path.read_text())
         elif chunk_index == 0:
-            manifest = {"total_chunks": total_chunks, "next": 0, "size": 0,
-                        "metadata": metadata or {}}
+            manifest = {
+                "total_chunks": total_chunks,
+                "next": 0,
+                "size": 0,
+                "metadata": metadata or {},
+            }
         else:
             raise ValidationError("First chunk is missing")
         if manifest["total_chunks"] != total_chunks or manifest["next"] != chunk_index:
@@ -135,6 +149,50 @@ class FileSystemStorage:
 
     def cancel_upload(self, upload_id: str) -> None:
         shutil.rmtree(self._staging_dir(upload_id), ignore_errors=True)
+
+    def append_stream(
+        self, upload_id: str, offset: int, data: BinaryIO, *, max_bytes: int, max_chunk_bytes: int
+    ) -> int:
+        """Append a request stream without materializing it in memory."""
+        if offset < 0 or offset > max_bytes:
+            raise ValidationError("Invalid upload offset")
+        staging = self._staging_dir(upload_id)
+        staging.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = self._safe(staging / "payload")
+        current = path.stat().st_size if path.exists() else 0
+        if current != offset:
+            raise ConflictError("Upload offset does not match server state")
+        received = 0
+        try:
+            with open(path, "ab") as out:
+                while block := data.read(1024 * 1024):
+                    received += len(block)
+                    if received > max_chunk_bytes or current + received > max_bytes:
+                        raise ValidationError("Upload chunk exceeds configured bound")
+                    out.write(block)
+        except Exception:
+            with open(path, "r+b") as out:
+                out.truncate(current)
+            raise
+        return received
+
+    def staged_path(self, upload_id: str) -> Path:
+        path = self._safe(self._staging_dir(upload_id) / "payload")
+        if not path.is_file():
+            raise NotFoundError("Staged upload not found")
+        return path
+
+    def finalize_staged_upload(self, upload_id: str, file_id: str) -> Path:
+        """Publish a resumable session payload exactly once."""
+        source = self.staged_path(upload_id)
+        destination = self._final_path(file_id)
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.link(source, destination)
+        except FileExistsError as exc:
+            raise ConflictError("File blob already exists") from exc
+        shutil.rmtree(self._staging_dir(upload_id), ignore_errors=True)
+        return destination
 
     def read_stream(self, file_id: str, offset: int = 0, length: int | None = None) -> BinaryIO:
         if offset < 0 or (length is not None and length < 0):

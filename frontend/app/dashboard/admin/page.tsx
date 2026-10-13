@@ -28,6 +28,8 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { api } from "@/lib/api"
 import { errorMessage } from "@/lib/types"
 import { MfaSettings } from "@/components/mfa-settings"
+import { Sidebar } from "@/components/sidebar"
+import { DashboardLayout } from "@/components/dashboard-layout"
 
 interface AdminUser {
   id: string
@@ -45,11 +47,6 @@ interface AuditLogEntry {
   entry_json: Record<string, unknown>
   entry_hash: string
   created_at: string
-}
-
-interface AuditLogList {
-  count: number
-  logs: AuditLogEntry[]
 }
 
 interface AuditVerifyResponse {
@@ -85,21 +82,13 @@ export default function AdminPage() {
   const [verifyUserId, setVerifyUserId] = useState("")
   const [verifyResult, setVerifyResult] = useState<AuditVerifyResponse | null>(null)
   const [verifying, setVerifying] = useState(false)
+  const [userSearch, setUserSearch] = useState("")
 
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
     setMounted(true)
   }, [])
-
-  useEffect(() => {
-    const t = memorySession.getItem("vaultx_access_token")
-    if (!mounted || !t) {
-      if (!t) router.replace("/")
-      return
-    }
-    loadUsers()
-  }, [mounted, router])
 
   const loadUsers = useCallback(async () => {
     if (typeof window === "undefined") return
@@ -116,6 +105,15 @@ export default function AdminPage() {
       setUsersLoading(false)
     }
   }, [])
+
+  useEffect(() => {
+    const t = memorySession.getItem("vaultx_access_token")
+    if (!mounted || !t) {
+      if (!t) router.replace("/")
+      return
+    }
+    loadUsers()
+  }, [loadUsers, mounted, router])
 
   const loadAuditLogs = useCallback(async () => {
     const t = memorySession.getItem("vaultx_access_token")
@@ -191,52 +189,105 @@ export default function AdminPage() {
   }
 
   const userInitial = (email: string) => email.charAt(0).toUpperCase()
+  const activeUserCount = users.filter((user) => user.is_active).length
+  const mfaUserCount = users.filter((user) => user.mfa_enabled).length
+  const adminUserCount = users.filter((user) => user.roles.includes("admin")).length
+  const filteredUsers = users.filter((user) => {
+    const query = userSearch.trim().toLowerCase()
+    return !query || user.email.toLowerCase().includes(query) || user.roles.some((role) => role.includes(query))
+  })
 
   return (
-    <div className="min-h-screen bg-background">
-      <header className="border-b border-border bg-card shadow-sm">
-        <div className="flex h-16 items-center justify-between px-6 max-w-[1200px] mx-auto">
-          <div className="flex items-center gap-3">
-            <Shield className="w-5 h-5 text-primary" strokeWidth={1.5} />
-            <span className="text-xl font-semibold text-foreground">Admin Dashboard</span>
+    <DashboardLayout>
+    <div className="flex min-h-0 flex-1 bg-background">
+      <Sidebar
+        activeSection="admin"
+        setActiveSection={() => {}}
+        onNavigate={(section) => {
+          if (section !== "admin") router.push("/dashboard")
+        }}
+      />
+      <div className="min-w-0 flex-1">
+      <header className="border-b border-border bg-card px-4 py-5 sm:px-6 lg:px-8">
+        <div className="mx-auto flex w-full max-w-7xl flex-wrap items-end justify-between gap-4">
+          <div>
+            <p className="vaultx-caption mb-1">Administration</p>
+            <div className="flex items-center gap-2">
+              <Shield className="h-5 w-5 text-primary" strokeWidth={1.5} />
+              <h1 className="text-xl font-semibold tracking-tight text-foreground">Admin Dashboard</h1>
+            </div>
+            <p className="mt-1 text-sm text-muted-foreground">Manage access, review audit activity, and enforce account security.</p>
           </div>
-          <nav className="flex gap-2">
+          <nav aria-label="Administration sections" role="tablist" className="grid w-full max-w-[520px] grid-cols-3 gap-1 rounded-md border border-border bg-muted/40 p-1">
             <Button
+              role="tab"
+              aria-label="Users"
+              aria-selected={activeTab === "users"}
+              title="Users"
               variant={activeTab === "users" ? "default" : "ghost"}
               size="sm"
+              className="min-w-0 px-2"
               onClick={() => setActiveTab("users")}
             >
-              <Users className="w-4 h-4 mr-2" strokeWidth={1.5} />
-              Users
+              <Users className="h-4 w-4 sm:mr-2" strokeWidth={1.5} />
+              <span className="hidden sm:inline">Users</span>
             </Button>
             <Button
+              role="tab"
+              aria-label="Audit Logs"
+              aria-selected={activeTab === "audit"}
+              title="Audit Logs"
               variant={activeTab === "audit" ? "default" : "ghost"}
               size="sm"
+              className="min-w-0 px-2"
               onClick={() => {
                 setActiveTab("audit")
                 loadAuditLogs()
               }}
             >
-              <Lock className="w-4 h-4 mr-2" strokeWidth={1.5} />
-              Audit Logs
+              <Lock className="h-4 w-4 sm:mr-2" strokeWidth={1.5} />
+              <span className="hidden sm:inline">Audit Logs</span>
             </Button>
             <Button
+              role="tab"
+              aria-label="MFA Settings"
+              aria-selected={activeTab === "mfa"}
+              title="MFA Settings"
               variant={activeTab === "mfa" ? "default" : "ghost"}
               size="sm"
+              className="min-w-0 px-2"
               onClick={() => setActiveTab("mfa")}
             >
-              <Shield className="w-4 h-4 mr-2" strokeWidth={1.5} />
-              MFA Settings
+              <Shield className="h-4 w-4 sm:mr-2" strokeWidth={1.5} />
+              <span className="hidden sm:inline">MFA Settings</span>
             </Button>
           </nav>
         </div>
       </header>
 
-      <main className="max-w-[1200px] mx-auto p-6">
+      <main className="mx-auto w-full max-w-7xl space-y-6 px-4 py-6 sm:px-6 lg:px-8">
         {/* Users Tab */}
-        <div className={activeTab !== "users" ? "hidden" : "space-y-4"}>
-          <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold text-foreground">Users</h2>
+        <div className={activeTab !== "users" ? "hidden" : "space-y-5"}>
+          <div className="grid overflow-hidden rounded-md border border-border bg-border sm:grid-cols-3 sm:gap-px">
+            <div className="bg-card px-4 py-3">
+              <p className="text-xs font-medium text-muted-foreground">Total accounts</p>
+              <p className="mt-1 text-2xl font-semibold tabular-nums text-foreground">{users.length}</p>
+            </div>
+            <div className="bg-card px-4 py-3">
+              <p className="text-xs font-medium text-muted-foreground">Active accounts</p>
+              <p className="mt-1 text-2xl font-semibold tabular-nums text-foreground">{activeUserCount}</p>
+            </div>
+            <div className="bg-card px-4 py-3">
+              <p className="text-xs font-medium text-muted-foreground">Administrators · MFA enabled</p>
+              <p className="mt-1 text-2xl font-semibold tabular-nums text-foreground">{adminUserCount} <span className="text-sm font-normal text-muted-foreground">· {mfaUserCount} MFA</span></p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <h2 className="text-lg font-semibold text-foreground">User accounts</h2>
+              <p className="mt-1 text-sm text-muted-foreground">Review roles, account status, and multi-factor coverage.</p>
+            </div>
             <Button size="sm" onClick={() => setShowCreateDialog(true)}>
               <Plus className="w-4 h-4 mr-2" strokeWidth={1.5} />
               Create User
@@ -249,9 +300,26 @@ export default function AdminPage() {
             </div>
           )}
 
-          <div className="border border-border rounded-lg overflow-hidden">
-            <table className="w-full">
-              <thead className="bg-muted/20">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="relative w-full max-w-sm">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" strokeWidth={1.5} />
+              <Input
+                aria-label="Search users"
+                placeholder="Search email or role"
+                value={userSearch}
+                onChange={(event) => setUserSearch(event.target.value)}
+                className="h-10 pl-9"
+              />
+            </div>
+            <p className="text-sm tabular-nums text-muted-foreground" aria-live="polite">
+              {filteredUsers.length} of {users.length} accounts
+            </p>
+          </div>
+
+          <div className="overflow-x-auto rounded-md border border-border bg-card">
+            <table className="w-full min-w-[760px]">
+              <caption className="sr-only">User accounts, roles, multi-factor status, creation dates, and actions</caption>
+              <thead className="bg-muted/50">
                 <tr>
                   <th className="text-left py-3 px-4 text-xs font-medium text-muted-foreground uppercase tracking-wider">
                     User
@@ -272,21 +340,21 @@ export default function AdminPage() {
               </thead>
               <tbody className="divide-y divide-border">
                 {usersLoading ? (
-                  <tr>
+                  <tr className="border-b border-border">
                     <td colSpan={5} className="py-8 text-center text-muted-foreground">
                       <Loader2 className="w-5 h-5 animate-spin mx-auto mb-2" />
                       Loading users…
                     </td>
                   </tr>
-                ) : users.length === 0 ? (
+                ) : filteredUsers.length === 0 ? (
                   <tr>
                     <td colSpan={5} className="py-8 text-center text-muted-foreground">
-                      No users found.
+                      {users.length === 0 ? "No users found." : "No accounts match this search."}
                     </td>
                   </tr>
                 ) : (
-                  users.map((u) => (
-                    <tr key={u.id}>
+                  filteredUsers.map((u) => (
+                    <tr key={u.id} className="transition-colors hover:bg-muted/30">
                       <td className="py-3 px-4">
                         <div className="flex items-center gap-3">
                           <Avatar className="h-8 w-8">
@@ -335,6 +403,8 @@ export default function AdminPage() {
                           className="h-7 text-muted-foreground hover:text-destructive"
                           onClick={() => handleDeactivateUser(u.id)}
                           disabled={!u.is_active || u.roles.includes("admin")}
+                          aria-label={`Deactivate ${u.email}`}
+                          title={`Deactivate ${u.email}`}
                         >
                           <Trash2 className="w-4 h-4" strokeWidth={1.5} />
                         </Button>
@@ -538,6 +608,8 @@ export default function AdminPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      </div>
     </div>
+    </DashboardLayout>
   )
 }

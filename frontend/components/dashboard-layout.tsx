@@ -92,9 +92,9 @@ export function DashboardLayout({ children, onSearch, onNavigate, workspaceConte
           {/* Left Section: Logo + app name */}
           <div className="flex items-center space-x-3">
             <div className="size-10 rounded-lg border-b-2 border-emerald bg-primary flex items-center justify-center">
-              <VaultIcon className="w-5 h-5 text-primary-foreground" />
+              <VaultIcon className="w-5 h-5 translate-y-0.5 text-primary-foreground" />
             </div>
-            <span className="text-xl font-semibold text-foreground tracking-tight">
+              <span className="text-xl font-semibold leading-none text-foreground tracking-tight">
               VaultX
             </span>
           </div>

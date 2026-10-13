@@ -2,7 +2,7 @@
 
 import React, { useRef, useState } from "react"
 import { useRouter } from "next/navigation"
-import { Eye, EyeOff, Lock, Mail, AlertCircle, Shield } from "lucide-react"
+import { Eye, EyeOff, Lock, Mail, AlertCircle, Shield, KeyRound } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -29,6 +29,7 @@ export function LoginForm() {
   const [mfaCode, setMfaCode] = useState("")
   const [showMfa, setShowMfa] = useState(false)
   const [mfaToken, setMfaToken] = useState<string | null>(null)
+  const [passkeyBusy, setPasskeyBusy] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [showPassword, setShowPassword] = useState(false)
@@ -142,6 +143,56 @@ export function LoginForm() {
     }
   }
 
+  async function handlePasskeySubmit() {
+    if (!mfaToken || passkeyBusy || !window.PublicKeyCredential) return
+    setPasskeyBusy(true)
+    clearError()
+    try {
+      const options = await api.post("/auth/webauthn/authentication/options", undefined, mfaToken)
+      const decode = (value: string) => {
+        const normalized = value.replace(/-/g, "+").replace(/_/g, "/")
+        const binary = atob(normalized + "=".repeat((4 - normalized.length % 4) % 4))
+        return Uint8Array.from(binary, char => char.charCodeAt(0)).buffer
+      }
+      const credential = await navigator.credentials.get({
+        publicKey: {
+          ...options,
+          challenge: decode(options.challenge),
+          allowCredentials: (options.allowCredentials || []).map((item: { id: string; type: string; transports?: string[] }) => ({
+            ...item, id: decode(item.id),
+          })),
+        },
+      }) as PublicKeyCredential | null
+      if (!credential) throw new Error("Passkey verification was cancelled.")
+      const encode = (value: ArrayBuffer) => {
+        const bytes = new Uint8Array(value)
+        let binary = ""
+        bytes.forEach(byte => { binary += String.fromCharCode(byte) })
+        return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+      }
+      const assertion = credential.response as AuthenticatorAssertionResponse
+      const verified = await api.post("/auth/webauthn/authentication/verify", {
+        id: credential.id,
+        rawId: encode(credential.rawId),
+        type: credential.type,
+        response: {
+          clientDataJSON: encode(assertion.clientDataJSON),
+          authenticatorData: encode(assertion.authenticatorData),
+          signature: encode(assertion.signature),
+          userHandle: assertion.userHandle ? encode(assertion.userHandle) : null,
+        },
+      }, mfaToken)
+      const accessToken = verified.access_token
+      if (!accessToken || !verified.keys) throw new Error("The server returned no vault keys. Please log in again.")
+      await activateSession(accessToken, verified.keys, password, email)
+      router.push("/dashboard")
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Passkey verification failed. Please try again.")
+    } finally {
+      setPasskeyBusy(false)
+    }
+  }
+
   /**
    * Unwrap the vault key bundle with the password-derived key and populate the
    * in-memory VaultXContext that every authenticated screen reads.
@@ -194,12 +245,12 @@ export function LoginForm() {
 
   return (
     <Card className="w-full max-w-md mx-auto border-border shadow-none">
-      <CardHeader className="space-y-5 text-center pb-4">
+      <CardHeader className="space-y-5 text-center pt-6 pb-4">
         <div className="flex items-center justify-center space-x-2">
           <div className="w-9 h-9 rounded-lg bg-primary flex items-center justify-center">
-            <VaultIcon className="w-5 h-5 text-primary-foreground" />
+            <VaultIcon className="w-5 h-5 translate-y-0.5 text-primary-foreground" />
           </div>
-          <span className="text-xl font-semibold tracking-tight text-foreground">
+          <span className="text-xl font-semibold leading-none tracking-tight text-foreground">
             VaultX
           </span>
         </div>
@@ -215,7 +266,7 @@ export function LoginForm() {
         </div>
       </CardHeader>
 
-      <CardContent className="space-y-5">
+      <CardContent className="space-y-5 pb-6">
         {error && !showMfa && (
           <div role="alert" className="flex items-start gap-2.5 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
             <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
@@ -223,14 +274,20 @@ export function LoginForm() {
           </div>
         )}
 
-           {showMfa ? (
-             <div className="space-y-4">
+             {showMfa ? (
+              <div className="space-y-4">
                <div className="flex items-center justify-center pb-2">
                  <Shield className="w-8 h-8 text-primary" strokeWidth={1.5} />
                </div>
-               <OtpDeck value={mfaCode} onChange={(code) => { setMfaCode(code); clearError() }}
-                 onVerify={handleMfaSubmit} busy={loading} error={error} autoFocus actionLabel="Verify & Sign In" />
-             </div>
+                <OtpDeck value={mfaCode} onChange={(code) => { setMfaCode(code); clearError() }}
+                  onVerify={handleMfaSubmit} busy={loading} error={error} autoFocus actionLabel="Verify & Sign In" />
+                <div className="relative flex items-center gap-3 py-1 text-xs text-muted-foreground"><span className="h-px flex-1 bg-border" /><span>or</span><span className="h-px flex-1 bg-border" /></div>
+                <Button type="button" variant="outline" className="w-full h-11" disabled={loading || passkeyBusy}
+                  onClick={handlePasskeySubmit}>
+                  <KeyRound className="mr-2 h-4 w-4" />
+                  {passkeyBusy ? "Verifying passkey…" : "Use a passkey"}
+                </Button>
+              </div>
            ) : (
              <form onSubmit={handleSubmit} className="space-y-4">
                <div className="space-y-2">

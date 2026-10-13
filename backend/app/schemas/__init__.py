@@ -43,6 +43,14 @@ from app.schemas.share import (
     SharedLinkCreate,
     SharedLinkRead,
 )
+from app.schemas.transfer import (
+    DropboxCreate,
+    DropboxRead,
+    DropboxUploadRead,
+    UploadSessionCreate,
+    UploadSessionFinalize,
+    UploadSessionRead,
+)
 from app.schemas.user import IndexStateResponse, IndexStateUpdate
 
 __all__ = [
@@ -55,6 +63,9 @@ __all__ = [
     "AuditVerifyResponse",
     # Auth
     "AuthResponse",
+    "DropboxCreate",
+    "DropboxRead",
+    "DropboxUploadRead",
     # File
     "FileBatchList",
     "FileDownloadResponse",
@@ -84,6 +95,9 @@ __all__ = [
     "TamperLogRead",
     "TokenPayload",
     "TokenResponse",
+    "UploadSessionCreate",
+    "UploadSessionFinalize",
+    "UploadSessionRead",
     "UserCreate",
     "UserKeysResponse",
     "UserLogin",

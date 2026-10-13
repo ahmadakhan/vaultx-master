@@ -55,10 +55,16 @@ export const api = {
       headers: json ? { "Content-Type": "application/json" } : {},
       body: json ? JSON.stringify(data) : data as BodyInit,
     })),
+  patch: async (endpoint: string, data: BodyInit, token?: string, json = false, extraHeaders?: Record<string, string>) =>
+    jsonResponse(await request(endpoint, token, {
+      method: "PATCH",
+      headers: { ...(json ? { "Content-Type": "application/json" } : {}), ...extraHeaders },
+      body: json ? JSON.stringify(data) : data,
+    })),
   get: async (endpoint: string, token?: string, extraHeaders?: Record<string, string>) =>
     jsonResponse(await request(endpoint, token, { headers: { Accept: "application/json", ...extraHeaders } })),
-  getRaw: async (endpoint: string, token?: string, range?: string, extraHeaders?: Record<string, string>) =>
-    request(endpoint, token, { headers: { Accept: "application/octet-stream", ...(range ? { Range: range } : {}), ...extraHeaders } }),
+  getRaw: async (endpoint: string, token?: string, range?: string, extraHeaders?: Record<string, string>, signal?: AbortSignal) =>
+    request(endpoint, token, { signal, headers: { Accept: "application/octet-stream", ...(range ? { Range: range } : {}), ...extraHeaders } }),
   delete: async (endpoint: string, token?: string) =>
     jsonResponse(await request(endpoint, token, { method: "DELETE" })),
 };

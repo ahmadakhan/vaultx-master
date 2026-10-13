@@ -11,12 +11,13 @@ import { Progress } from "@/components/ui/progress"
 import { api } from "@/lib/api"
 import { bufToB64, b64ToBuf } from "@/lib/crypto/base"
 import { decryptStringWithAes } from "@/lib/crypto/aes"
+import { buildChunkAad } from "@/lib/crypto/aes"
 import {
   deriveAesKeyFromPassphrase,
   decryptWithPassphrase,
   shareLinkPassphrase,
 } from "@/lib/crypto/passphrase"
-import { decryptChunkedGCM, CHUNK_SIZE } from "@/lib/crypto/chunking"
+import { CHUNK_SIZE } from "@/lib/crypto/chunking"
 
 interface FileMetadata {
   id: string
@@ -52,6 +53,13 @@ export default function SharedAccessPage() {
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null)
   const [accessGranted, setAccessGranted] = useState(false)
   const fileKey = useRef<string | null>(null)
+  const downloadAbort = useRef<AbortController | null>(null)
+
+  // The fallback deliberately has a bound. Large downloads use the
+  // File System Access API when the browser exposes it, avoiding a second
+  // whole-file ciphertext/plaintext allocation. Native mobile support is not
+  // implied by this capability check.
+  const MAX_BUFFERED_DOWNLOAD = 256 * 1024 * 1024
 
   useEffect(() => {
     fileKey.current = null
@@ -151,17 +159,32 @@ export default function SharedAccessPage() {
 
     setDownloading(true)
     setProgress(0)
+    const abort = new AbortController()
+    downloadAbort.current = abort
 
     try {
       let received = 0
       const total = metadata.file_size || 0
-      const chunks: Uint8Array[] = []
+      let bufferedPlaintext = 0
+      const plaintextParts: Uint8Array[] = []
+      let sink: FileSystemWritableFileStream | null = null
+      const picker = (window as unknown as { showSaveFilePicker?: (options?: unknown) => Promise<{ createWritable: () => Promise<FileSystemWritableFileStream> }> }).showSaveFilePicker
+      if (picker) {
+        try {
+          const handle = await picker({ suggestedName: fileInfo.name })
+          sink = await handle.createWritable()
+        } catch (error) {
+          if (error instanceof DOMException && error.name === "AbortError") return
+          // A denied picker is recoverable; use the bounded in-memory path.
+        }
+      }
 
       const response = await api.getRaw(
         `/shares/link/${token}/download`,
         undefined,
         undefined,
         accessCode ? { "X-Access-Code": accessCode } : undefined,
+        abort.signal,
       )
 
       // Headers contain metadata
@@ -172,49 +195,60 @@ export default function SharedAccessPage() {
 
       if (!kf_b64) throw new Error("Missing file encryption key")
 
-      // Stream the ciphertext
+      // Decrypt framed ciphertext as it arrives. Each frame is independently
+      // authenticated, so no complete ciphertext buffer is required.
+      const kf_key = await window.crypto.subtle.importKey("raw", b64ToBuf(kf_b64), { name: "AES-GCM" }, false, ["decrypt"])
+      const nonce = new Uint8Array(b64ToBuf(fileIv || metadata.file_iv))
+      if (nonce.byteLength !== 12) throw new Error("Invalid file IV")
+      const frameSize = (fileInfo.chunk_size ?? CHUNK_SIZE) + 16
+      let pending = new Uint8Array(0)
+      let frameIndex = 0
+      const consume = async (frame: Uint8Array, final: boolean) => {
+        if (frame.byteLength < 16 || (!final && frame.byteLength !== frameSize)) throw new Error("Malformed encrypted file")
+        const iv = new Uint8Array(nonce)
+        new DataView(iv.buffer).setUint32(8, frameIndex++, false)
+        const params: AesGcmParams = {
+          name: "AES-GCM",
+          iv,
+          additionalData: buildChunkAad(1, metadata.id, frameIndex - 1, frame.byteLength - 16) as BufferSource,
+        }
+        const decrypted = await window.crypto.subtle.decrypt(params, kf_key, frame as BufferSource)
+        const plain = new Uint8Array(decrypted)
+        bufferedPlaintext += plain.byteLength
+        if (!sink && bufferedPlaintext > MAX_BUFFERED_DOWNLOAD) throw new Error("This browser cannot safely download files larger than 256 MiB; use a browser with file-save streaming support.")
+        if (sink) await sink.write(plain)
+        else plaintextParts.push(plain)
+      }
       const reader = response.body!.getReader()
       while (true) {
+        if (abort.signal.aborted) throw new DOMException("Download cancelled", "AbortError")
         const { done, value } = await reader.read()
         if (done) break
         if (value) {
-          chunks.push(value)
           received += value.length
+          const merged = new Uint8Array(pending.byteLength + value.byteLength)
+          merged.set(pending); merged.set(value, pending.byteLength)
+          pending = merged
+          while (pending.byteLength >= frameSize) {
+            await consume(pending.slice(0, frameSize), false)
+            pending = pending.slice(frameSize)
+          }
           if (total > 0) {
             setProgress(Math.min((received / total) * 100, 99))
           }
         }
       }
-
-      // Merge chunks
-      const combined = new Uint8Array(received)
-      let offset = 0
-      for (const chunk of chunks) {
-        combined.set(chunk, offset)
-        offset += chunk.byteLength
+      if (pending.byteLength) await consume(pending, true)
+      if (received < 16 || bufferedPlaintext !== fileInfo.size) throw new Error("File size does not match authenticated metadata")
+      if (sink) {
+        await sink.close()
+        setProgress(100)
+        return
       }
-
-      // Decrypt file content
-      const kf_key = await window.crypto.subtle.importKey(
-        "raw",
-        b64ToBuf(kf_b64),
-        { name: "AES-GCM" },
-        false,
-        ["decrypt"],
-      )
-      // Segment-wise GCM decryption (the file was sealed chunk-by-chunk with
-      // counter-derived IVs derived from the persisted file nonce).
-      const plaintext = await decryptChunkedGCM(
-        combined.buffer as ArrayBuffer,
-        kf_key,
-        fileIv || metadata.file_iv,
-        fileInfo.chunk_size ?? CHUNK_SIZE,
-        fileInfo.size,
-      )
+      const plaintext = new Blob(plaintextParts.map(part => part.buffer as ArrayBuffer))
 
       // Create download
-      const blob = new Blob([plaintext])
-      const url = URL.createObjectURL(blob)
+      const url = URL.createObjectURL(plaintext)
       setDownloadUrl(url)
       const a = document.createElement("a")
       a.href = url
@@ -225,11 +259,14 @@ export default function SharedAccessPage() {
       console.error("Download failed:", err)
       setError(err instanceof Error ? err.message : "Download failed.")
     } finally {
+      downloadAbort.current = null
       setDownloading(false)
       setProgress(100)
       setTimeout(() => setProgress(0), 500)
     }
   }
+
+  const cancelDownload = () => downloadAbort.current?.abort()
 
   if (loading) {
     return (
@@ -375,6 +412,9 @@ export default function SharedAccessPage() {
                     </>
                   )}
                 </Button>
+                {downloading && (
+                  <Button variant="outline" className="ml-2" onClick={cancelDownload}>Cancel</Button>
+                )}
 
                 {downloadUrl && (
                   <div className="flex items-center gap-2 text-xs text-green-500">

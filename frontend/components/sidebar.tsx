@@ -86,22 +86,35 @@ export function Sidebar({ activeSection, setActiveSection, onNavigate }: Sidebar
 
       <nav aria-label="Workspace" className="flex-1 px-3 py-5 space-y-1 overflow-y-auto">
         {adminItems.map((item) => {
+          const isActive = activeSection === item.value;
           const button = (
             <Button
               key={item.value}
               variant="ghost"
               size={collapsed ? "icon" : "default"}
-              className="w-full justify-start h-10 relative text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+              className={cn(
+                "w-full justify-start h-10 relative transition-colors",
+                isActive
+                  ? "bg-accent/60 text-primary hover:bg-accent/70"
+                  : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+              )}
               onClick={() => {
                 router.push("/dashboard/admin")
               }}
               aria-label={item.label}
               title={item.label}
+              aria-current={isActive ? "page" : undefined}
             >
               <span className="flex items-center shrink-0 w-5 justify-center">
                 {item.icon}
               </span>
               {!collapsed && <span className="sidebar-label">{item.label}</span>}
+              {isActive && (
+                <span className={cn(
+                  "absolute left-0 top-1/2 h-6 w-1 -translate-y-1/2 rounded-r bg-primary",
+                  collapsed && "hidden"
+                )} />
+              )}
             </Button>
           );
 

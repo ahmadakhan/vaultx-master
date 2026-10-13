@@ -32,12 +32,14 @@ import { api } from "@/lib/api";
 import { errorMessage } from "@/lib/types";
 import { memorySession } from "@/lib/crypto/context";
 import mammoth from "mammoth";
+import { createDurableUploadState, runDurableUpload, cancelDurableUpload, type DurableUploadState } from "@/lib/resumable-upload";
 
 interface UploadFile {
   id: string;
   file: File;
   progress: number;
-  status: "preparing" | "pending" | "uploading" | "pausing" | "paused" | "completed" | "error" | "stopped";
+  status: "preparing" | "pending" | "uploading" | "pausing" | "paused" | "cancelling" | "completed" | "error" | "stopped";
+  transfer: DurableUploadState;
   activeMs?: number;
   errorMessage?: string;
   selectedKeywords?: string[];
@@ -201,6 +203,10 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess, initialFiles 
 
   const closeModal = (openState: boolean) => {
     if (!openState && workerActive.current) return;
+    if (!openState && filesRef.current.some((f) => f.transfer.begin && !["completed", "stopped"].includes(f.status))) {
+      setQueueError("Resume or abort unfinished uploads before closing.");
+      return;
+    }
     if (!openState) {
       resetModal();
     }
@@ -261,6 +267,7 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess, initialFiles 
       uploadedBytes: 0,
       pausedAtChunk: 0,
       totalChunks: Math.ceil(file.size / CHUNK_SIZE) || 1,
+      transfer: createDurableUploadState(),
     }));
     setUploadFiles((prev) => [...prev, ...newFiles]);
     for (const item of newFiles) {
@@ -298,20 +305,41 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess, initialFiles 
     );
   };
 
-  const handleStopUpload = (fileId: string) => {
+  const handleStopUpload = async (fileId: string) => {
+    const item = filesRef.current.find((f) => f.id === fileId);
+    if (!item || item.status === "completed" || item.status === "cancelling") return;
+    const active = ["uploading", "pausing"].includes(item.status);
+    if (!active && workerActive.current && item.transfer.begin) return;
     setUploadFiles((prev) =>
       prev.map((f) =>
         f.id === fileId && f.status !== "completed"
-          ? { ...f, status: "stopped" }
+          ? { ...f, status: active || f.transfer.begin ? "cancelling" : "stopped" }
           : f
       )
     );
+    if (active) return; // The worker cancels after reconciling its in-flight request.
+    if (item.transfer.begin) {
+      workerActive.current = true;
+      setIsUploading(true);
+      try {
+        const token = memorySession.getItem("vaultx_access_token");
+        if (!token) throw new Error("Please log in again to cancel the upload.");
+        await cancelDurableUpload(item.transfer, token);
+        item.transfer.pending = undefined;
+        setUploadFiles((prev) => prev.map((f) => f.id === fileId ? { ...f, status: "stopped" } : f));
+      } catch (error) {
+        setUploadFiles((prev) => prev.map((f) => f.id === fileId ? { ...f, status: "error", errorMessage: errorMessage(error, "Cancellation failed; retry or resume") } : f));
+      } finally {
+        workerActive.current = false;
+        setIsUploading(false);
+      }
+    }
   };
 
   async function handleDone(fileId?: string) {
     if (workerActive.current || filesRef.current.some((f) => f.status === "preparing")) return;
     const pendingFiles = filesRef.current.filter(
-      (f) => (!fileId || f.id === fileId) && (f.status === "pending" || f.status === "paused")
+      (f) => (!fileId || f.id === fileId) && (f.status === "pending" || f.status === "paused" || f.status === "error")
     );
     if (pendingFiles.length === 0) return;
 
@@ -390,7 +418,10 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess, initialFiles 
       if (status === "pausing") {
         setUploadFiles((prev) => prev.map((f) => f.id === item.id ? { ...f, status: "paused", activeMs: elapsed() } : f));
       }
-      return status === "pausing" || status === "stopped" || !status;
+      if (status === "cancelling" && !item.transfer.session) {
+        setUploadFiles((prev) => prev.map((f) => f.id === item.id ? { ...f, status: "stopped" } : f));
+      }
+      return status === "pausing" || status === "cancelling" || status === "stopped" || !status;
     };
 
     setUploadFiles((prev) =>
@@ -508,19 +539,40 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess, initialFiles 
     }
 
     const totalSize = item.file.size;
-    let uploadedBytes = Math.min(item.pausedAtChunk * CHUNK_SIZE, totalSize);
-    const totalChunks = Math.ceil(totalSize / CHUNK_SIZE) || 1;
     const fileNonce = Uint8Array.from(atob(fileEncIv), (c) => c.charCodeAt(0));
-
-      for (let chunkIndex = item.pausedAtChunk; chunkIndex < totalChunks; chunkIndex++) {
-        if (stopAtBoundary()) return false;
-
+    const result = await runDurableUpload({
+      state: item.transfer,
+      fileId: item.id,
+      plaintextSize: totalSize,
+      chunkSize: CHUNK_SIZE,
+      token,
+      payload: {
+        metadata_ciphertext_b64: metadataEnc.ciphertext_b64,
+        metadata_iv_b64: metadataEnc.iv_b64,
+        encrypted_kf_b64: kfEnc.ciphertext_b64,
+        encrypted_kf_iv_b64: kfEnc.iv_b64,
+        file_iv_b64: fileEncIv,
+        tokens: JSON.parse(tokens_json),
+      },
+      control: () => {
+        const status = filesRef.current.find((f) => f.id === item.id)?.status;
+        return status === "cancelling" || status === "stopped" || !status ? "cancel" : status === "pausing" ? "pause" : "run";
+      },
+      onAcknowledged: (chunks) => {
+        const uploadedBytes = Math.min(chunks * CHUNK_SIZE, totalSize);
+        setUploadFiles((prev) => prev.map((f) => f.id === item.id ? {
+          ...f, uploadedBytes, pausedAtChunk: chunks,
+          progress: totalSize === 0 ? (chunks ? 100 : 0) : uploadedBytes / totalSize * 100,
+          activeMs: elapsed(),
+        } : f));
+      },
+      encrypt: async (chunkIndex) => {
         const start = chunkIndex * CHUNK_SIZE;
         const end = Math.min(start + CHUNK_SIZE, totalSize);
         const chunk = item.file.slice(start, end);
         const chunkBuffer = await chunk.arrayBuffer();
         try {
-          const fileKeyBytes = Uint8Array.from(atob(fileKey_b64), (c) => c.charCodeAt(0));
+          const fileKeyBytes = Uint8Array.from(atob(fileKey_b64!), (c) => c.charCodeAt(0));
           let chunkKey: CryptoKey;
           try {
             chunkKey = await crypto.subtle.importKey(
@@ -536,44 +588,25 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess, initialFiles 
 
           // Derive this chunk's IV from the persisted file nonce + chunk index.
           const chunkIv = buildChunkIv(fileNonce, chunkIndex);
-        const encryptedChunk = await aesEncryptArrayBuffer(chunkBuffer, chunkKey, chunkIv);
-        if (stopAtBoundary()) return false;
+        const encryptedChunk = await aesEncryptArrayBuffer(chunkBuffer, chunkKey, chunkIv, undefined, chunkIndex, item.id);
         const chunkBytes = Uint8Array.from(atob(encryptedChunk.ciphertext_b64), (c) =>
           c.charCodeAt(0)
         );
 
-        const formData = new FormData();
-        formData.append("file_id", item.id);
-        formData.append("metadata_ciphertext", metadataEnc.ciphertext_b64);
-        formData.append("metadata_iv", metadataEnc.iv_b64);
-        formData.append("encrypted_kf_b64", kfEnc.ciphertext_b64);
-        formData.append("encrypted_kf_iv", kfEnc.iv_b64);
-        formData.append("file_iv", fileEncIv);
-        formData.append("tokens_json", tokens_json);
-        formData.append("file", new Blob([chunkBytes.buffer]));
-        formData.append("chunk_index", String(chunkIndex));
-        formData.append("total_chunks", String(totalChunks));
-        formData.append("is_last_chunk", chunkIndex === totalChunks - 1 ? "true" : "false");
-
-        await api.post("/files/upload", formData, token, false);
-
-        uploadedBytes = end;
-        const percent = totalSize === 0 ? 100 : (uploadedBytes / totalSize) * 100;
-        setUploadFiles((prev) =>
-          prev.map((f) =>
-            f.id === item.id && f.status !== "stopped"
-              ? { ...f, progress: percent, uploadedBytes, pausedAtChunk: chunkIndex + 1, activeMs: elapsed() }
-              : f
-          )
-        );
+        return new Blob([chunkBytes.buffer]);
       } finally {
         // Only the owned plaintext chunk can be overwritten, not runtime copies.
         new Uint8Array(chunkBuffer).fill(0);
       }
+      },
+    });
+    if (result !== "finalized") {
+      setUploadFiles((prev) => prev.map((f) => f.id === item.id ? { ...f, status: result === "paused" ? "paused" : "stopped", activeMs: elapsed() } : f));
+      return false;
     }
 
-    // Acknowledgement of the final chunk commits the file on the server.
-    // Finish its search head even if stop/pause arrived during that request.
+    // Finalization commits the file. Finish its search head even if a control
+    // arrived during finalization; a committed file cannot be cancelled.
     // Persist the search head after each completed file, using actual async
     // completion rather than the stale React snapshot captured by the caller.
     const chainJson = JSON.stringify(keywordChains);
@@ -597,12 +630,17 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess, initialFiles 
 
   const handleResumeUpload = async (fileId: string) => {
     const file = filesRef.current.find((f) => f.id === fileId);
-    if (!file || file.status !== "paused") return;
+    if (!file || (file.status !== "paused" && file.status !== "error")) return;
     await handleDone(fileId);
   };
 
-  const removeFile = (id: string) =>
+  const removeFile = (id: string) => {
+    if (filesRef.current.find((f) => f.id === id)?.transfer.begin) {
+      setQueueError("Abort the server upload before removing this file.");
+      return;
+    }
     setUploadFiles((prev) => prev.filter((f) => f.id !== id));
+  };
 
   const completedCount = uploadFiles.filter(
     (f) => f.status === "completed"
@@ -634,8 +672,8 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess, initialFiles 
           <DialogTitle>Upload Files</DialogTitle>
           <DialogDescription className="text-sm text-muted-foreground">
             Files are encrypted client-side before leaving your device.
-            {" "}Files upload sequentially. Pause waits for the current chunk request and holds the queue. Abort does not undo chunks already sent;
-            a final chunk already in flight may complete the file.
+            {" "}Files upload sequentially. Pause waits for a server-acknowledged boundary. Abort cancels the server session;
+            a fully received or finalized upload may need to be resumed to finish publication.
           </DialogDescription>
         </DialogHeader>
 
@@ -752,7 +790,7 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess, initialFiles 
 
                   {f.status === "stopped" && (
                     <p className="mt-1 text-xs text-muted-foreground">
-                      Stopped locally. Requests already sent may still finish.
+                      Upload cancelled.
                     </p>
                   )}
 
@@ -803,7 +841,7 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess, initialFiles 
                   </Button>
                 )}
 
-                {f.status === "paused" && (
+                {(f.status === "paused" || f.status === "error") && (
                   <Button
                     variant="ghost"
                     size="sm"
@@ -817,7 +855,7 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess, initialFiles 
                   </Button>
                 )}
 
-                {f.status !== "stopped" && f.status !== "completed" && (
+                {f.status !== "stopped" && f.status !== "completed" && f.status !== "cancelling" && (
                   <Button
                     variant="ghost"
                     size="sm"
@@ -887,7 +925,7 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess, initialFiles 
               size="sm"
               onClick={() => handleDone()}
               className="min-h-11"
-              disabled={isUploading || uploadFiles.some((f) => f.status === "preparing") || !uploadFiles.some((f) => f.status === "pending" || f.status === "paused")}
+              disabled={isUploading || uploadFiles.some((f) => f.status === "preparing") || !uploadFiles.some((f) => f.status === "pending" || f.status === "paused" || f.status === "error")}
             >
               {isUploading ? "Uploading…" : "Start / resume queue"}
             </Button>

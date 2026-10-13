@@ -115,6 +115,16 @@ class Settings(BaseSettings):
     max_upload_bytes: int = Field(11_000_000_000, alias="MAX_UPLOAD_BYTES", ge=1)
     storage_dir: str = Field("/var/vaultx/storage", alias="STORAGE_DIR")
 
+    # --- WebAuthn ---
+    # These values are intentionally explicit and are used for both option
+    # generation and verification.  Origins are never inferred from a request.
+    webauthn_rp_id: str = Field("localhost", alias="WEBAUTHN_RP_ID")
+    webauthn_rp_name: str = Field("VaultX", alias="WEBAUTHN_RP_NAME")
+    webauthn_origin: str = Field("http://localhost:3000", alias="WEBAUTHN_ORIGIN")
+    webauthn_challenge_ttl_seconds: int = Field(
+        300, alias="WEBAUTHN_CHALLENGE_TTL_SECONDS", ge=30, le=900
+    )
+
     model_config = SettingsConfigDict(
         env_file=_ENV_FILE,
         env_file_encoding="utf-8",
@@ -152,6 +162,11 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _validate_secrets(self) -> Any:
         """Reject placeholder/duplicate secrets and warn when they leak into dev."""
+        if self.app_env == "prod":
+            raise ValueError(
+                "VaultX security prototype cannot start with APP_ENV=prod; "
+                "complete the documented assurance gates before production deployment"
+            )
         if self.app_secret_key == self.jwt_secret_key:
             raise ValueError("APP_SECRET_KEY and JWT_SECRET_KEY must be different values")
 
@@ -209,6 +224,23 @@ class Settings(BaseSettings):
     def cors_origins(self) -> list[str]:
         """Parse comma-separated ``ALLOWED_ORIGINS`` into a list."""
         return [origin.strip() for origin in self.allowed_origins.split(",") if origin.strip()]
+
+    @model_validator(mode="after")
+    def _validate_webauthn(self) -> Any:
+        from urllib.parse import urlparse
+
+        if not self.webauthn_rp_id or "*" in self.webauthn_rp_id or "/" in self.webauthn_rp_id:
+            raise ValueError("WEBAUTHN_RP_ID must be a concrete host name")
+        parsed = urlparse(self.webauthn_origin)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("WEBAUTHN_ORIGIN must be one absolute http(s) origin")
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment or parsed.username:
+            raise ValueError(
+                "WEBAUTHN_ORIGIN must not contain a path, query, fragment, or credentials"
+            )
+        if parsed.hostname != self.webauthn_rp_id:
+            raise ValueError("WEBAUTHN_ORIGIN hostname must exactly match WEBAUTHN_RP_ID")
+        return self
 
 
 settings = Settings()  # type: ignore[call-arg]

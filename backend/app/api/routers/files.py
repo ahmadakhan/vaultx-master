@@ -38,6 +38,7 @@ from app.core.audit_decorator import audit_event
 from app.core.deps import get_current_user, get_current_user_mfa_verified
 from app.core.exceptions import AuthorizationError, ConflictError, NotFoundError, ValidationError
 from app.core.logging import get_logger
+from app.core.tenant import release_storage, reserve_storage
 from app.db import get_db
 from app.models import File, FileShare, IndexEntry, User
 from app.schemas.file import (
@@ -74,6 +75,7 @@ def _decode_b64(value: str) -> bytes:
 def _get_current_time() -> datetime:
     """Return current UTC time for placeholder timestamps on chunk uploads."""
     from app.models.base import utcnow
+
     return utcnow()
 
 
@@ -185,9 +187,19 @@ async def upload_file(
 
     # --- Decode form fields (required on first chunk, optional on subsequent) ---
     if chunk_index == 0 or not is_chunked:
-        if any(len(value) > 8192 for value in (
-            metadata_ciphertext, metadata_iv, encrypted_kf_b64, encrypted_kf_iv, file_iv
-        )) or len(tokens_json) > 5_000_000:
+        if (
+            any(
+                len(value) > 8192
+                for value in (
+                    metadata_ciphertext,
+                    metadata_iv,
+                    encrypted_kf_b64,
+                    encrypted_kf_iv,
+                    file_iv,
+                )
+            )
+            or len(tokens_json) > 5_000_000
+        ):
             raise ValidationError("Upload metadata is too large")
         metadata_bytes = _decode_b64(metadata_ciphertext)
         metadata_iv_b = _decode_b64(metadata_iv)
@@ -234,15 +246,24 @@ async def upload_file(
     metadata = None
     if chunk_index == 0:
         metadata = {
-            "metadata_ciphertext": metadata_ciphertext, "metadata_iv": metadata_iv,
-            "encrypted_kf_b64": encrypted_kf_b64, "encrypted_kf_iv": encrypted_kf_iv,
-            "file_iv": file_iv, "tokens": [entry.model_dump() for entry in tokens],
+            "metadata_ciphertext": metadata_ciphertext,
+            "metadata_iv": metadata_iv,
+            "encrypted_kf_b64": encrypted_kf_b64,
+            "encrypted_kf_iv": encrypted_kf_iv,
+            "file_iv": file_iv,
+            "tokens": [entry.model_dump() for entry in tokens],
         }
     try:
         with storage.upload_lock(upload_id):
-            upload_complete = await run_in_threadpool(storage.write_chunk,
-                upload_id, chunk_index, total_chunks, file.file, is_last_chunk,
-                max_bytes=_settings.max_upload_bytes, metadata=metadata,
+            upload_complete = await run_in_threadpool(
+                storage.write_chunk,
+                upload_id,
+                chunk_index,
+                total_chunks,
+                file.file,
+                is_last_chunk,
+                max_bytes=_settings.max_upload_bytes,
+                metadata=metadata,
             )
             if not upload_complete:
                 return FileUploadResponse(id=file_uuid, created_at=_get_current_time())
@@ -254,10 +275,12 @@ async def upload_file(
             file_iv_b = _decode_b64(saved["file_iv"])
             tokens = saved["tokens"]
             if tokens:
-                existing_tokens = await db.execute(select(IndexEntry.token).where(
-                    IndexEntry.owner_id == current_user.id,
-                    IndexEntry.token.in_([_decode_b64(entry["token"]) for entry in tokens]),
-                ))
+                existing_tokens = await db.execute(
+                    select(IndexEntry.token).where(
+                        IndexEntry.owner_id == current_user.id,
+                        IndexEntry.token.in_([_decode_b64(entry["token"]) for entry in tokens]),
+                    )
+                )
                 if existing_tokens.first():
                     raise ConflictError("Search token already exists")
             blob_path = storage._final_path(str(file_uuid))
@@ -265,8 +288,10 @@ async def upload_file(
     finally:
         await file.close()
 
+    tenant_id = getattr(current_user, "tenant_id", None)
     new_file = File(
         id=file_uuid,
+        tenant_id=tenant_id,
         owner_id=current_user.id,
         ciphertext=None,
         storage_path=str(blob_path),
@@ -297,12 +322,15 @@ async def upload_file(
             IndexEntry(
                 token=token_b,
                 owner_id=current_user.id,
+                tenant_id=getattr(current_user, "tenant_id", None),
                 value=value_json,
                 prev_token=prev_b,
             )
         )
 
     try:
+        if tenant_id:
+            await reserve_storage(db, tenant_id, blob_size)
         # Check all DB constraints before publishing a blob. The unique file ID
         # also serializes competing owners attempting to publish the same ID.
         await db.flush()
@@ -678,7 +706,9 @@ async def download_file(
                     yield data
                     remaining -= len(data)
 
-        range_response = StreamingResponse(_range_generator(), media_type="application/octet-stream")
+        range_response = StreamingResponse(
+            _range_generator(), media_type="application/octet-stream"
+        )
         range_response.headers["Content-Range"] = f"bytes {range_start}-{range_end}/{total_size}"
         range_response.headers["Content-Length"] = str(range_end - range_start + 1)
         range_response.headers["Accept-Ranges"] = "bytes"
@@ -689,12 +719,12 @@ async def download_file(
         range_response.headers["X-Metadata-Iv"] = metadata_iv_b64
         if encrypted_kf_b64:
             range_response.headers["X-Encrypted-Kf"] = encrypted_kf_b64
-            range_response.headers["X-Encrypted-Kf-Iv"] = base64.b64encode(f.encrypted_kf_iv or b"").decode()
+            range_response.headers["X-Encrypted-Kf-Iv"] = base64.b64encode(
+                f.encrypted_kf_iv or b""
+            ).decode()
         if wrapped_key_b64:
             range_response.headers["X-Wrapped-Key"] = wrapped_key_b64
-        range_response.headers["X-Created-At"] = (
-            f.created_at.isoformat() if f.created_at else ""
-        )
+        range_response.headers["X-Created-At"] = f.created_at.isoformat() if f.created_at else ""
         range_response.status_code = 206
         return range_response
 
@@ -710,7 +740,9 @@ async def download_file(
                         break
                     yield chunk
 
-        stream_response = StreamingResponse(_stream_generator(), media_type="application/octet-stream")
+        stream_response = StreamingResponse(
+            _stream_generator(), media_type="application/octet-stream"
+        )
         stream_response.headers["Content-Length"] = str(blob_size)
         stream_response.headers["Accept-Ranges"] = "bytes"
         stream_response.headers["X-File-Id"] = str(f.id)
@@ -719,18 +751,20 @@ async def download_file(
         stream_response.headers["X-Metadata-Iv"] = metadata_iv_b64
         if encrypted_kf_b64:
             stream_response.headers["X-Encrypted-Kf"] = encrypted_kf_b64
-            stream_response.headers["X-Encrypted-Kf-Iv"] = base64.b64encode(f.encrypted_kf_iv or b"").decode()
+            stream_response.headers["X-Encrypted-Kf-Iv"] = base64.b64encode(
+                f.encrypted_kf_iv or b""
+            ).decode()
         if wrapped_key_b64:
             stream_response.headers["X-Wrapped-Key"] = wrapped_key_b64
-        stream_response.headers["X-Created-At"] = (
-            f.created_at.isoformat() if f.created_at else ""
-        )
+        stream_response.headers["X-Created-At"] = f.created_at.isoformat() if f.created_at else ""
         return stream_response
 
     # Small file or legacy DB-stored ciphertext — inline response
     return {
         "id": str(f.id),
-        "ciphertext": base64.b64encode(blob_path.read_bytes() if blob_path else (f.ciphertext or b"")).decode(),
+        "ciphertext": base64.b64encode(
+            blob_path.read_bytes() if blob_path else (f.ciphertext or b"")
+        ).decode(),
         "file_iv": file_iv_b64,
         "metadata_ciphertext": metadata_ct_b64,
         "metadata_iv": metadata_iv_b64,
@@ -877,6 +911,8 @@ async def purge_file(
 
     file_id_str = str(file.id)
     has_blob = bool(file.storage_path)
+    if file.tenant_id and file.file_size:
+        await release_storage(db, file.tenant_id, file.file_size)
     await db.delete(file)
     await db.commit()
     if has_blob:

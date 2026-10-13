@@ -1,6 +1,6 @@
 # VaultX
 
-VaultX is a full-stack secure storage platform built to demonstrate how encrypted cloud storage, searchable data, and tamper-proof auditing can coexist in a single system.
+VaultX is a full-stack secure-storage prototype built to demonstrate how encrypted cloud storage, searchable data, and verifiable auditing can coexist in a single system.
 It includes a FastAPI backend, a Next.js frontend, and a PostgreSQL database.
 All encryption and verification are handled by the application itself — no third-party encryption services or external key managers are used.
 
@@ -9,9 +9,9 @@ All encryption and verification are handled by the application itself — no thi
 ## Overview
 
 VaultX implements an **encrypted cloud storage architecture** where every piece of data stored on the server—files, logs, and user information—is encrypted using AES-256-GCM.
-It provides encrypted search through hashed keywords, tamper-proof activity logging, and role-based access control for multi-user environments.
+It provides a hashed-keyword search prototype, hash-linked activity logging, and role-based access controls for multi-user environments.
 
-The project is designed as a real, working model of a privacy-first storage system, suitable for academic study, internal enterprise deployment, or as a base for production-grade secure applications.
+The project is intended for academic study and security engineering experimentation. It is not a production security certification or a claim of zero-knowledge, post-quantum, multi-tenant, or compliance-ready operation.
 
 ---
 
@@ -72,11 +72,11 @@ This approach enables efficient encrypted search with the tradeoff of equality l
 All API actions (uploads, downloads, deletions, permission updates, searches) are encrypted using **AES-256-GCM** with the logs key.
 Each log entry includes an optional hash link to the previous entry, forming a verifiable chain.
 
-This design ensures:
+This design is intended to provide:
 
 * Encrypted, non-readable logs
 * Detection of any modification or deletion
-* Replay-resistant audit trails
+* A verifiable hash-linked audit trail (replay resistance is not established by this prototype alone)
 
 ---
 
@@ -97,16 +97,16 @@ All AES-GCM operations authenticate data, providing both confidentiality and int
 
 ## System Behavior
 
-* Plaintext data never touches disk or the database.
-* Every encrypted record can be verified for authenticity upon decryption.
-* The application can search, list, and log events without compromising user privacy.
-* PostgreSQL only stores ciphertext and hashes.
-* The frontend never directly handles keys or performs cryptographic operations; the backend does.
+* The application attempts to keep encrypted payloads off persistent storage in its normal paths; deployment and runtime behavior must still be verified.
+* AES-GCM records can be authenticated when the correct key, nonce, and associated data are supplied.
+* Hashed-keyword search reduces direct plaintext exposure but leaks equality and access patterns.
+* PostgreSQL stores encrypted fields in the covered paths; this is not a guarantee that every field or deployment is ciphertext-only.
+* File encryption is implemented in frontend crypto helpers; authentication and storage operations remain server-side.
 
 ---
 
 ## Design Intent
 
-VaultX was built as a **complete demonstration of encrypted infrastructure** — not just a backend service.
+VaultX was built as a **working prototype of encrypted infrastructure** — not a completed security architecture.
 It shows how a secure file vault can handle storage, search, access control, and auditing in a single cohesive stack.
 The system prioritizes verifiability, isolation of cryptographic domains, and low operational complexity.

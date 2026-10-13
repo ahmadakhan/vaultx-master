@@ -23,10 +23,10 @@ import { decryptBytesWithAes, decryptStringWithAes } from "@/lib/crypto/aes";
 import { getVaultXContext, clearVaultXContext } from "@/lib/crypto/context";
 import { api } from "@/lib/api";
 import { b64ToBuf, bufToB64 } from "@/lib/crypto/base";
-import { decryptChunkedGCM } from "@/lib/crypto/chunking";
 import type { FileItem, RawFile } from "@/lib/types";
 import { errorMessage } from "@/lib/types";
 import type { DownloadProgressInfo } from "@/lib/transfer-ui";
+import { downloadOwnerFile, discardOwnerDownload, type OwnerDownloadResumeState } from "@/lib/owner-download";
 
 export function FileManager() {
   const [viewMode, setViewMode] = useState<"grid" | "list">("list");
@@ -45,10 +45,21 @@ export function FileManager() {
 
   const [activeSection, setActiveSection] = useState("My Vault");
   const [downloadProgress, setDownloadProgress] = useState<Record<string, DownloadProgressInfo>>({});
-  const pausedDownloads = useRef<Record<string, { received: number; total: number; chunks: Uint8Array[]; activeMs: number }>>({});
+  const pausedDownloads = useRef<Record<string, OwnerDownloadResumeState>>({});
   const downloadIntent = useRef<Record<string, "pause" | "stop">>({});
   const abortControllers = useRef<Record<string, AbortController>>({});
   const suppressNextFetch = useRef(false);
+
+  useEffect(() => () => {
+    for (const [id, controller] of Object.entries(abortControllers.current)) {
+      downloadIntent.current[id] = "stop";
+      controller.abort();
+    }
+    for (const state of Object.values(pausedDownloads.current)) {
+      void discardOwnerDownload(state).catch(() => undefined);
+    }
+    pausedDownloads.current = {};
+  }, []);
 
   const decryptFiles = useCallback(async (filesRaw: RawFile[]) => {
     const masterKey_b64 = memorySession.getItem("vaultx_master_key");
@@ -260,16 +271,6 @@ export function FileManager() {
     [decryptFiles, fetchAllFiles, activeSection]
   );
 
-  const _mergeChunks = (chunks: Uint8Array[], total: number): ArrayBuffer => {
-    const result = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return result.buffer;
-  };
-
   const handleDownloadFile = async (id: string) => {
     const file = files.find((f) => f.id === id);
     if (!file) {
@@ -302,6 +303,8 @@ export function FileManager() {
     if (controller) {
       controller.abort();
     }
+    const saved = pausedDownloads.current[id];
+    if (saved && !controller) void discardOwnerDownload(saved).catch(() => undefined);
     setDownloadProgress((prev) => ({
       ...prev,
       [id]: { ...prev[id], status: "stopped" },
@@ -329,196 +332,50 @@ export function FileManager() {
     const controller = new AbortController();
     abortControllers.current[fileId] = controller;
     delete downloadIntent.current[fileId];
-    const started = performance.now();
     const saved = isResume ? pausedDownloads.current[fileId] : undefined;
-    let previousMs = saved?.activeMs ?? 0;
-    const activeMs = () => previousMs + performance.now() - started;
 
     setDownloadProgress((prev) => ({
       ...prev,
-      [fileId]: { percent: saved && saved.total > 0 ? saved.received / saved.total * 100 : 0, bytes: saved?.received ?? 0, total: saved?.total ?? 0, activeMs: previousMs, status: "downloading" },
+      [fileId]: { percent: saved && saved.totalCiphertext > 0 ? saved.ciphertextOffset / saved.totalCiphertext * 100 : 0, bytes: saved?.ciphertextOffset ?? 0, total: saved?.totalCiphertext ?? 0, activeMs: saved?.activeMs ?? 0, status: "downloading" },
     }));
 
-    let totalBytes = 0;
-    let file_iv = "";
-    let encrypted_kf_b64: string | null = null;
-    let encrypted_kf_iv: string | null = null;
-    let wrapped_key_b64: string | null = null;
-    let ciphertext: ArrayBuffer | null = null;
-
-    let rangeStart = 0;
-    let receivedChunks: Uint8Array[] = [];
-    let receivedBytes = 0;
-
-    if (saved) {
-      receivedBytes = saved.received;
-      receivedChunks = [...saved.chunks];
-      rangeStart = receivedBytes;
-    }
-    const settleCancellation = () => {
-      if (!controller.signal.aborted) return false;
-      if (downloadIntent.current[fileId] === "pause") {
-        pausedDownloads.current[fileId] = { received: receivedBytes, total: totalBytes, chunks: receivedChunks, activeMs: activeMs() };
-        setDownloadProgress((prev) => ({ ...prev, [fileId]: { percent: totalBytes > 0 ? receivedBytes / totalBytes * 100 : 0, bytes: receivedBytes, total: totalBytes, activeMs: activeMs(), status: "paused" } }));
-      }
-      delete abortControllers.current[fileId];
-      return true;
-    };
-
     try {
-      const rangeHeader = `bytes=${rangeStart}-`;
-      const res = await api.getRaw(
-        `/files/${fileId}/download?range=${encodeURIComponent(rangeHeader)}`,
-        ctx.accessToken,
-        rangeHeader
-      );
-
-      if (res.status === 206 || res.headers.get("Content-Type")?.includes("application/octet-stream")) {
-        // A server may ignore Range and send the whole body. Never append that
-        // body to previously downloaded bytes.
-        if (res.status !== 206) {
-          receivedChunks = [];
-          receivedBytes = 0;
-          previousMs = 0;
-          totalBytes = Number(res.headers.get("Content-Length")) || 0;
-        }
-        file_iv = res.headers.get("X-File-Iv") || "";
-        encrypted_kf_b64 = res.headers.get("X-Encrypted-Kf");
-        encrypted_kf_iv = res.headers.get("X-Encrypted-Kf-Iv") || null;
-        wrapped_key_b64 = res.headers.get("X-Wrapped-Key") || null;
-
-        const contentRange = res.headers.get("Content-Range");
-        if (contentRange) {
-          const parts = contentRange.split("/");
-          totalBytes = parseInt(parts[1], 10);
-        }
-
-        const reader = res.body?.getReader();
-        if (!reader) {
-          throw new Error("Streaming not supported by browser");
-        }
-
-        while (true) {
-          if (controller.signal.aborted) {
-            await reader.cancel();
-            settleCancellation();
-            return;
-          }
-
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          receivedChunks.push(value);
-          receivedBytes += value.length;
-
-           const percent = totalBytes > 0 ? (receivedBytes / totalBytes) * 100 : 0;
-          setDownloadProgress((prev) => ({
-            ...prev,
-            [fileId]: { percent, bytes: receivedBytes, total: totalBytes, activeMs: activeMs(), status: controller.signal.aborted ? downloadIntent.current[fileId] === "stop" ? "stopped" : "pausing" : "downloading" },
-          }));
-        }
-
-        ciphertext = _mergeChunks(receivedChunks, receivedBytes);
-      } else {
-        const data = await res.json();
-        ciphertext = b64ToBuf(data.ciphertext) as ArrayBuffer;
-        file_iv = data.file_iv;
-        encrypted_kf_b64 = data.encrypted_kf_b64;
-        encrypted_kf_iv = data.encrypted_kf_iv;
-        wrapped_key_b64 = data.wrapped_key_b64;
-        totalBytes = ciphertext.byteLength;
-        receivedBytes = totalBytes;
-      }
-    } catch (err) {
-      if (settleCancellation()) return;
-      setError(errorMessage(err, "Download failed"));
-      setDownloadProgress(prev => ({ ...prev, [fileId]: { percent: 0, status: "error" } }));
-      delete abortControllers.current[fileId];
-      return;
-    }
-
-    if (settleCancellation()) return;
-    delete pausedDownloads.current[fileId];
-    const measuredMs = activeMs();
-    setDownloadProgress((prev) => ({ ...prev, [fileId]: { percent: 100, bytes: receivedBytes, total: totalBytes, activeMs: measuredMs, status: "decrypting" } }));
-    try {
-      const masterKey_b64 = memorySession.getItem("vaultx_master_key");
-      if (!masterKey_b64) throw new Error("Missing master key — please log in again.");
-
-      let kf_b64: string | null = null;
-
-      if (encrypted_kf_b64 && encrypted_kf_iv) {
-        const kf_bytes = await decryptBytesWithAes(
-          encrypted_kf_b64,
-          encrypted_kf_iv,
-          masterKey_b64
-        );
-        kf_b64 = bufToB64(kf_bytes.buffer);
-      } else if (wrapped_key_b64) {
-        const privateKeyPem = memorySession.getItem("vaultx_private_key");
-        if (!privateKeyPem) throw new Error("Missing RSA private key — please log in again.");
-
-        const privateKey = await window.crypto.subtle.importKey(
-          "pkcs8",
-          Uint8Array.from(atob(privateKeyPem), (c) => c.charCodeAt(0)),
-          { name: "RSA-OAEP", hash: "SHA-256" },
-          false,
-          ["decrypt"]
-        );
-
-        const encryptedBytes = Uint8Array.from(atob(wrapped_key_b64), (c) => c.charCodeAt(0));
-        const unwrappedKey = await window.crypto.subtle.decrypt(
-          { name: "RSA-OAEP" },
-          privateKey,
-          encryptedBytes
-        );
-
-        kf_b64 = bufToB64(unwrappedKey);
-      } else {
-        throw new Error("No valid key material found for this file.");
-      }
-
-      if (settleCancellation()) return;
-
+      const fileKeyB64 = memorySession.getItem(`vaultx_kf_${fileId}`);
+      if (!fileKeyB64) throw new Error("Missing file encryption key — please load the file list again.");
       const fileKey = await crypto.subtle.importKey(
-        "raw",
-        Uint8Array.from(atob(kf_b64), (c) => c.charCodeAt(0)),
-        { name: "AES-GCM" },
-        false,
-        ["decrypt"]
+        "raw", b64ToBuf(fileKeyB64), { name: "AES-GCM" }, false, ["decrypt"],
       );
-
-      // Segment-wise GCM decryption: files are sealed chunk-by-chunk, each
-      // chunk with an IV derived from the persisted file nonce + index.
-      const decryptedBytes = await decryptChunkedGCM(ciphertext!, fileKey, file_iv, file.chunkSize, file.plaintextSize);
-      if (settleCancellation()) return;
-
-      const blob = new Blob([decryptedBytes]);
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = file.name || "download";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.URL.revokeObjectURL(url);
-
-      setDownloadProgress((prev) => ({
-        ...prev,
-        [fileId]: { percent: 100, bytes: receivedBytes, total: totalBytes, activeMs: measuredMs, status: "completed" },
-      }));
-      delete abortControllers.current[fileId];
+      const result = await downloadOwnerFile({
+        fileId,
+        token: ctx.accessToken,
+        fileName: file.name || "download",
+        key: fileKey,
+        chunkSize: file.chunkSize,
+        expectedPlaintextSize: file.plaintextSize,
+        resume: saved,
+        signal: controller.signal,
+        intent: () => downloadIntent.current[fileId] === "pause" ? "pause" : downloadIntent.current[fileId] === "stop" ? "cancel" : undefined,
+        onProgress: ({ received, total, activeMs: elapsed }) => setDownloadProgress((prev) => ({
+          ...prev,
+          [fileId]: { percent: total > 0 ? Math.min(received / total * 100, 99) : 0, bytes: received, total, activeMs: elapsed, status: "downloading" },
+        })),
+      });
+      if (result.status === "paused") {
+        pausedDownloads.current[fileId] = result.resume;
+        setDownloadProgress((prev) => ({ ...prev, [fileId]: { percent: result.resume.totalCiphertext > 0 ? result.resume.ciphertextOffset / result.resume.totalCiphertext * 100 : 0, bytes: result.resume.ciphertextOffset, total: result.resume.totalCiphertext, activeMs: result.resume.activeMs, status: "paused" } }));
+      } else if (result.status === "cancelled") {
+        delete pausedDownloads.current[fileId];
+        setDownloadProgress((prev) => ({ ...prev, [fileId]: { ...prev[fileId], status: "stopped" } }));
+      } else {
+        delete pausedDownloads.current[fileId];
+        setDownloadProgress((prev) => ({ ...prev, [fileId]: { percent: 100, bytes: result.received, total: result.total, activeMs: result.activeMs, status: "completed" } }));
+      }
     } catch (err) {
-      // Everything after the streaming phase (key unwrap, decryption, blob
-      // creation) must surface failures instead of dying as an unhandled
-      // rejection with the spinner stuck on "downloading".
-      if (settleCancellation()) return;
+      delete pausedDownloads.current[fileId];
       console.error("Download failed:", err);
       alert(errorMessage(err, "Download failed"));
-      setDownloadProgress((prev) => ({
-        ...prev,
-        [fileId]: { percent: 0, status: "error" },
-      }));
+      setDownloadProgress((prev) => ({ ...prev, [fileId]: { percent: 0, status: "error" } }));
+    } finally {
       delete abortControllers.current[fileId];
     }
   }, []);

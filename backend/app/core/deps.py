@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AuthenticationError, AuthorizationError
 from app.core.security import ACCESS_TOKEN_TYPE, decode_token, hash_token_identifier
+from app.core.tenant import set_tenant_context
 from app.db import get_db
 from app.models import RefreshToken, User, UserRole
 
@@ -78,6 +79,7 @@ async def get_current_user(
     if user.mfa_enabled and not valid_mfa_claim(payload):
         raise AuthenticationError("MFA verification required")
 
+    await set_tenant_context(db, user.tenant_id)
     return user
 
 

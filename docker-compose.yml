@@ -11,13 +11,21 @@ services:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - vaultx_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vaultx_user -d vaultx"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
   backend:
     build: ./backend
     container_name: vaultx_backend
     restart: always
     environment:
-      APP_ENV: prod
+      # The application intentionally rejects APP_ENV=prod until external
+      # production assurance gates are completed. This Compose stack is a
+      # staging/evidence environment, not a production deployment.
+      APP_ENV: staging
       APP_SECRET_KEY: ${APP_SECRET_KEY:?APP_SECRET_KEY must be set}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set}
       JWT_ALGORITHM: HS256
@@ -28,6 +36,7 @@ services:
       DB_NAME: vaultx
       DB_USER: vaultx_user
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
+      DB_SSL_MODE: disable
       MAIL_HOST: smtp.gmail.com
       MAIL_PORT: 587
       MAIL_USERNAME: noreply
@@ -38,15 +47,64 @@ services:
       KEYS_DIR: /etc/vaultx/keys
       FALLBACK_KEYS_DIR: .secret/keys
       ALLOWED_ORIGINS: "http://localhost:3000,http://vaultx.local"
+      TRUSTED_PROXY_CIDRS: "172.20.0.0/16,172.16.0.0/12,192.168.0.0/16"
       RATE_LIMIT_RATE: 100
       RATE_LIMIT_CAPACITY: 200
+      LOGIN_MAX_ATTEMPTS: 5
+      LOGIN_LOCKOUT_SECONDS: 900
+      TRASH_RETENTION_DAYS: 30
+      MAX_UPLOAD_BYTES: 10737418240
+      STORAGE_DIR: /var/vaultx/storage
+      WEBAUTHN_RP_ID: vaultx.local
+      WEBAUTHN_RP_NAME: VaultX
+      WEBAUTHN_ORIGIN: http://vaultx.local
+      AUDIT_LOG_PATH: /var/vaultx/logs/audit.log
+      AUDIT_LOG_RETENTION_DAYS: 90
+      AUDIT_SIGN_KEYS_DIR: /etc/vaultx/signing_keys
+      SECURITY_HEADERS_ENABLED: "true"
+      ENABLE_MONITORING: "true"
     depends_on:
-      - db
+      migrate:
+        condition: service_completed_successfully
     networks:
       - vaultx_net
     volumes:
       - vaultx_keys:/etc/vaultx/keys
+      - vaultx_signing_keys:/etc/vaultx/signing_keys
       - vaultx_storage:/var/vaultx/storage
+      - vaultx_logs:/var/vaultx/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  migrate:
+    build: ./backend
+    container_name: vaultx_migrate
+    restart: "no"
+    environment:
+      APP_ENV: staging
+      APP_SECRET_KEY: ${APP_SECRET_KEY:?APP_SECRET_KEY must be set}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set}
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: vaultx
+      DB_USER: vaultx_user
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
+      MAIL_HOST: smtp.gmail.com
+      MAIL_USERNAME: noreply
+      MAIL_PASSWORD: ${MAIL_PASSWORD:?MAIL_PASSWORD must be set}
+      MAIL_FROM: "VaultX <noreply@vaultx.in>"
+      KEYS_DIR: /etc/vaultx/keys
+      FALLBACK_KEYS_DIR: .secret/keys
+    command: ["python", "-m", "app.migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - vaultx_net
 
   frontend:
     build:
@@ -71,4 +129,6 @@ networks:
 volumes:
   postgres_data:
   vaultx_keys:
+  vaultx_signing_keys:
   vaultx_storage:
+  vaultx_logs:

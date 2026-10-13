@@ -30,6 +30,7 @@ from app.core.audit_decorator import audit_event
 from app.core.deps import get_current_user
 from app.core.exceptions import AuthorizationError, NotFoundError, ValidationError
 from app.core.logging import get_logger
+from app.core.tenant import set_public_capability_context
 from app.db import get_db
 from app.models import File, FileShare, SharedLink, User
 from app.models.file import SharedLinkAttempt
@@ -58,9 +59,15 @@ async def _check_access_code(db: AsyncSession, link: SharedLink, code: str | Non
     guard = await db.get(SharedLinkAttempt, link.id)
     now = datetime.now(UTC)
     if guard and guard.locked_until:
-        locked_until = guard.locked_until.replace(tzinfo=UTC) if guard.locked_until.tzinfo is None else guard.locked_until
+        locked_until = (
+            guard.locked_until.replace(tzinfo=UTC)
+            if guard.locked_until.tzinfo is None
+            else guard.locked_until
+        )
         if locked_until > now:
-            raise HTTPException(429, "Too many access-code attempts", headers={"Retry-After": "900"})
+            raise HTTPException(
+                429, "Too many access-code attempts", headers={"Retry-After": "900"}
+            )
         guard.failed_attempts = 0
         guard.locked_until = None
     valid = await run_in_threadpool(verify_access_code, code, link.access_code_hash)
@@ -104,10 +111,15 @@ def _build_share_read(share: FileShare) -> FileShareRead:
 
 def _link_read(link: SharedLink) -> SharedLinkRead:
     return SharedLinkRead(
-        id=link.id, file_id=link.file_id, token=link.token,
-        has_access_code=bool(link.access_code_hash), expires_at=link.expires_at,
-        max_downloads=link.max_downloads, download_count=link.download_count,
-        created_at=link.created_at, link_url=f"/shared/{link.token}",
+        id=link.id,
+        file_id=link.file_id,
+        token=link.token,
+        has_access_code=bool(link.access_code_hash),
+        expires_at=link.expires_at,
+        max_downloads=link.max_downloads,
+        download_count=link.download_count,
+        created_at=link.created_at,
+        link_url=f"/shared/{link.token}",
     )
 
 
@@ -174,6 +186,7 @@ async def share_file(
         return _build_share_read(existing)
 
     share = FileShare(
+        tenant_id=getattr(current_user, "tenant_id", None),
         file_id=payload.file_id,
         owner_user_id=current_user.id,
         recipient_user_id=recipient.id,
@@ -357,6 +370,7 @@ async def create_shared_link(
         access_code_hash = await run_in_threadpool(hash_access_code, payload.access_code)
 
     link = SharedLink(
+        tenant_id=getattr(current_user, "tenant_id", None),
         file_id=payload.file_id,
         token=token,
         access_code_hash=access_code_hash,
@@ -496,6 +510,7 @@ async def get_shared_link_file(
             or the link has expired / exceeded its download limit.
     """
     response.headers["Cache-Control"] = "no-store"
+    await set_public_capability_context(db, link_token=token)
     result = await db.execute(select(SharedLink).where(SharedLink.token == token).with_for_update())
     link = result.scalar_one_or_none()
     if not link:
@@ -530,8 +545,12 @@ async def get_shared_link_file(
         "file_iv": base64.b64encode(f.file_iv or b"").decode(),
         "metadata_ciphertext": base64.b64encode(f.metadata_ciphertext or b"").decode(),
         "metadata_iv": base64.b64encode(f.metadata_iv or b"").decode(),
-        "encrypted_kf_b64": base64.b64encode(link.encrypted_kf).decode() if link.encrypted_kf else None,
-        "encrypted_kf_iv": base64.b64encode(link.encrypted_kf_iv).decode() if link.encrypted_kf_iv else None,
+        "encrypted_kf_b64": base64.b64encode(link.encrypted_kf).decode()
+        if link.encrypted_kf
+        else None,
+        "encrypted_kf_iv": base64.b64encode(link.encrypted_kf_iv).decode()
+        if link.encrypted_kf_iv
+        else None,
         "kf_salt": base64.b64encode(link.kf_salt).decode() if link.kf_salt else None,
         "has_access_code": link.access_code_hash is not None,
         "file_size": f.file_size,
@@ -566,6 +585,7 @@ async def download_shared_link_file(
     """
     from fastapi.responses import StreamingResponse
 
+    await set_public_capability_context(db, link_token=token)
     result = await db.execute(select(SharedLink).where(SharedLink.token == token).with_for_update())
     link = result.scalar_one_or_none()
     if not link:
@@ -607,12 +627,22 @@ async def download_shared_link_file(
             if start > end:
                 raise ValueError
         except ValueError as exc:
-            raise HTTPException(416, "Range not satisfiable", headers={"Content-Range": f"bytes */{total_size}"}) from exc
+            raise HTTPException(
+                416, "Range not satisfiable", headers={"Content-Range": f"bytes */{total_size}"}
+            ) from exc
     # Conditional update is an additional guard against lost updates.
-    result = await db.execute(update(SharedLink).where(
-        SharedLink.id == link.id,
-        or_(SharedLink.max_downloads.is_(None), SharedLink.download_count < SharedLink.max_downloads),
-    ).values(download_count=SharedLink.download_count + 1).returning(SharedLink.id))
+    result = await db.execute(
+        update(SharedLink)
+        .where(
+            SharedLink.id == link.id,
+            or_(
+                SharedLink.max_downloads.is_(None),
+                SharedLink.download_count < SharedLink.max_downloads,
+            ),
+        )
+        .values(download_count=SharedLink.download_count + 1)
+        .returning(SharedLink.id)
+    )
     if result.scalar_one_or_none() is None:
         raise NotFoundError("Link has reached maximum downloads")
     await db.commit()
@@ -631,7 +661,7 @@ async def download_shared_link_file(
                     remaining -= len(chunk)
         else:
             data = f.ciphertext or b""
-            yield data[start:end + 1]
+            yield data[start : end + 1]
 
     file_iv_b64 = base64.b64encode(f.file_iv or b"").decode()
     metadata_ct_b64 = base64.b64encode(f.metadata_ciphertext or b"").decode()

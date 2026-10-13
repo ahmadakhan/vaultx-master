@@ -15,7 +15,7 @@ export function AllocationMeter({ allocation }: { allocation: Allocation }) {
   const limitDisplay = allocation.status === "ready" ? allocation.limitBytes : null;
 
   return (
-    <div className="min-w-0 space-y-2 rounded-xl border border-border/80 bg-muted/20 p-3" aria-busy={allocation.status === "loading"}>
+    <div className="flex h-full min-w-0 flex-col justify-center space-y-2 rounded-xl border border-border/80 bg-muted/20 p-3" aria-busy={allocation.status === "loading"}>
       <div className="flex items-center justify-between gap-3 text-[11px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
         <span>Storage allocation</span>
         <span className={summary.overQuota ? "text-destructive" : "text-emerald-700 dark:text-emerald-400"}>{summary.label}</span>
@@ -71,8 +71,8 @@ export function WorkspaceHub({ adapter = PERSONAL_VAULT_CONTEXT }: { adapter?: W
 
   return (
     <section aria-label="Workspace context" aria-busy={pending !== null} className="border-b border-border bg-background/80 px-4 py-4 backdrop-blur-sm sm:px-6 lg:px-8">
-      <div className="mx-auto grid max-w-7xl gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(17rem,22rem)]">
-        <div className="min-w-0 rounded-xl border border-border bg-muted/20 p-3">
+      <div className="mx-auto grid max-w-7xl items-stretch gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(17rem,22rem)]">
+        <div className="h-full min-w-0 rounded-xl border border-border bg-muted/20 p-3">
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-3 min-w-0">
               <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-border bg-background text-foreground">
@@ -109,7 +109,7 @@ export function WorkspaceHub({ adapter = PERSONAL_VAULT_CONTEXT }: { adapter?: W
           {adapter.memberships.status === "error" && <p role="alert" className="mt-3 text-sm text-destructive">{adapter.memberships.message}</p>}
         </div>
 
-        <div className="self-center">
+        <div className="h-full min-w-0">
           <AllocationMeter allocation={adapter.allocation} />
         </div>
       </div>

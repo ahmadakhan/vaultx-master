@@ -1,6 +1,6 @@
 # VaultX Frontend Design System
 
-> "Secure Minimalism" — an enterprise-grade visual language for VaultX's
+> "Secure Minimalism" — a prototype visual language for VaultX's
 > encrypted cloud storage. Clean surfaces, subtle elevation, precise
 > typography, and a professional neutral palette anchored by a single deep-teal
 > accent.

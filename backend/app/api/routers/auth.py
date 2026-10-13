@@ -40,8 +40,17 @@ from app.core.security import (
     hash_token_identifier,
     verify_password,
 )
+from app.core.tenant import set_tenant_context
 from app.db import get_db
-from app.models import RefreshToken, User, UserRole, email_matches, normalize_email
+from app.models import (
+    RefreshToken,
+    Tenant,
+    TenantQuota,
+    User,
+    UserRole,
+    email_matches,
+    normalize_email,
+)
 from app.schemas import (
     AuthResponse,
     LogoutRequest,
@@ -218,9 +227,21 @@ async def register_user(
             "public_key_b64",
         )
     }
+    # Every account owns an isolated tenant from its first transaction.  Do
+    # not create tenantless users: RLS intentionally denies rows without a
+    # tenant context and such accounts could not be safely served.
+    tenant = Tenant(
+        tenant_id=str(uuid.uuid4()),
+        name=f"{email}'s Vault",
+    )
+    db.add(tenant)
+    await db.flush()
+    await set_tenant_context(db, tenant.id)
+    db.add(TenantQuota(tenant_id=tenant.id, storage_quota_bytes=tenant.storage_quota_bytes))
     user = User(
         email=email,
         password_hash=hash_password(payload.password),
+        tenant_id=tenant.id,
         **fields,
         key_bundle_version=payload.key_bundle_version,
         password_kdf_iterations=payload.kdf_iterations,

@@ -1,41 +1,241 @@
-import { deriveMasterKey, generateSearchKey, generateRSAKeyPair, generateFileKey, CURRENT_ACCOUNT_PBKDF2_ITERATIONS } from "./keys";
-import { aesEncryptArrayBuffer } from "./aes";
-import { bundleAad } from "./bundle";
+/**
+ * User key setup and management for VaultX authentication.
+ */
 
-export async function prepareUserKeyBundle(password: string) {
-  // 1. Derive password-based key
-  const { key: pwKey, salt_b64 } = await deriveMasterKey(password, undefined, CURRENT_ACCOUNT_PBKDF2_ITERATIONS);
+import { bufToB64, b64ToBuf, genRandomBytes } from "./base";
+import { memorySession } from './context';
+import { aesEncryptArrayBuffer } from './aes';
+import { bundleAad } from './bundle';
 
-  // 2. Generate core keys
-  const masterKey_b64 = await generateFileKey(); // Km
-  const searchKey_b64 = await generateSearchKey(); // Ks
-  const rsaPair = await generateRSAKeyPair(); // public/private
+export const ACCOUNT_PBKDF2_ITERATIONS = 150000;
+export const CURRENT_ACCOUNT_PBKDF2_ITERATIONS = 600000;
+const AES_KEY_LEN = 256;
 
-  // 3. Encrypt sensitive ones under password-derived key
-  const encMaster = await aesEncryptArrayBuffer(
-    Uint8Array.from(atob(masterKey_b64), (c) => c.charCodeAt(0)).buffer,
-    pwKey, undefined, bundleAad("master")
+export interface UserKeys {
+  password_salt_b64: string;
+  enc_master_key_b64: string;
+  enc_master_key_iv: string;
+  enc_search_key_b64: string;
+  enc_search_key_iv: string;
+  enc_private_key_b64: string;
+  enc_private_key_iv: string;
+  public_key_b64: string;
+  kdf_iterations: number;
+  key_bundle_version: number;
+}
+
+export interface UserKeysResponse {
+  password_salt_b64: string;
+  enc_master_key_b64: string;
+  enc_master_key_iv: string;
+  enc_search_key_b64: string;
+  enc_search_key_iv: string;
+  enc_private_key_b64: string;
+  enc_private_key_iv: string;
+  public_key_b64: string;
+  kdf_iterations: number;
+  key_bundle_version: number;
+}
+
+export async function deriveMasterKey(password: string, salt_b64?: string, iterations = ACCOUNT_PBKDF2_ITERATIONS): Promise<{ key: CryptoKey; salt_b64: string }> {
+  if (!Number.isSafeInteger(iterations) || iterations < ACCOUNT_PBKDF2_ITERATIONS || iterations > 10000000) {
+    throw new Error("Unsupported password KDF parameters");
+  }
+
+  const enc = new TextEncoder();
+  const pwKey = await crypto.subtle.importKey("raw", enc.encode(password), { name: "PBKDF2" }, false, ["deriveKey"]);
+
+  let salt: Uint8Array<ArrayBuffer>;
+  if (salt_b64) {
+    salt = new Uint8Array(b64ToBuf(salt_b64));
+  } else {
+    salt = new Uint8Array(genRandomBytes(16).buffer as ArrayBuffer);
+  }
+  if (salt.byteLength !== 16) throw new Error("Invalid password salt");
+
+  const key = await crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
+    pwKey,
+    { name: "AES-GCM", length: AES_KEY_LEN },
+    false,
+     ["encrypt", "decrypt"]
   );
 
-  const encSearch = await aesEncryptArrayBuffer(
-    Uint8Array.from(atob(searchKey_b64), (c) => c.charCodeAt(0)).buffer,
-    pwKey, undefined, bundleAad("search")
+  return { key, salt_b64: bufToB64(salt.buffer) };
+}
+
+export async function deriveSearchKey(masterKey: CryptoKey, tenantId: string): Promise<CryptoKey> {
+  const encoder = new TextEncoder();
+  const salt = encoder.encode(`search_${tenantId}_salt`);
+  
+  return await crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations: 300000,
+      hash: "SHA-256"
+    },
+    masterKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+export async function generateRSAKeyPair(): Promise<{ publicKey_b64: string; privateKey_b64: string }> {
+  const keyPair = await crypto.subtle.generateKey(
+    {
+      name: "RSA-OAEP",
+      modulusLength: 4096,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: "SHA-256",
+    },
+    true,
+    ["encrypt", "decrypt"]
   );
 
-  const privBuf = Uint8Array.from(atob(rsaPair.privateKey_b64), (c) => c.charCodeAt(0)).buffer;
-  const encPriv = await aesEncryptArrayBuffer(privBuf, pwKey, undefined, bundleAad("private"));
+  const pub = await crypto.subtle.exportKey("spki", keyPair.publicKey);
+  const priv = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
 
-  // 4. Return the payload to send to backend
   return {
-    key_bundle_version: 2,
-    kdf_iterations: CURRENT_ACCOUNT_PBKDF2_ITERATIONS,
-    password_salt_b64: salt_b64,
-    enc_master_key_b64: encMaster.ciphertext_b64,
-    enc_master_key_iv: encMaster.iv_b64,
-    enc_search_key_b64: encSearch.ciphertext_b64,
-    enc_search_key_iv: encSearch.iv_b64,
-    enc_private_key_b64: encPriv.ciphertext_b64,
-    enc_private_key_iv: encPriv.iv_b64,
-    public_key_b64: rsaPair.publicKey_b64,
+    publicKey_b64: bufToB64(pub),
+    privateKey_b64: bufToB64(priv),
   };
+}
+
+export async function encryptWithMasterKey(
+  data: ArrayBuffer,
+  masterKey: CryptoKey,
+  iv?: Uint8Array,
+  tenantId?: string
+): Promise<{ ciphertext_b64: string; iv_b64: string }> {
+  const encoder = new TextEncoder();
+  let additionalData: ArrayBuffer | undefined;
+  
+  if (tenantId) {
+    additionalData = encoder.encode(`tenant:${tenantId}_protected_data`).buffer as ArrayBuffer;
+  }
+  
+  const fileIv = iv || new Uint8Array(crypto.getRandomValues(new Uint8Array(12)));
+  
+  const encrypted = await crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+       iv: fileIv as BufferSource,
+       additionalData: additionalData as BufferSource | undefined,
+      tagLength: 128,
+    },
+    masterKey,
+    data
+  );
+  
+  return {
+    ciphertext_b64: bufToB64(encrypted),
+    iv_b64: bufToB64(fileIv.slice().buffer as ArrayBuffer)
+  };
+}
+
+export async function decryptWithMasterKey(
+  ciphertext_b64: string,
+  iv_b64: string,
+  masterKey: CryptoKey,
+  tenantId?: string
+): Promise<ArrayBuffer> {
+  const encrypted = b64ToBuf(ciphertext_b64);
+  const iv = new Uint8Array(b64ToBuf(iv_b64));
+  
+  const encoder = new TextEncoder();
+  let additionalData: ArrayBuffer | undefined;
+  
+  if (tenantId) {
+    additionalData = encoder.encode(`tenant:${tenantId}_protected_data`).buffer as ArrayBuffer;
+  }
+  
+  return await crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+       iv: iv as BufferSource,
+       additionalData: additionalData as BufferSource | undefined,
+      tagLength: 128,
+    },
+    masterKey,
+    encrypted
+  );
+}
+
+export async function setupUserKeys(userId: string): Promise<UserKeys> {
+  // The registration helper receives the password directly; the legacy
+  // session helper may instead provide it by user id.
+  const password = memorySession.getItem(`vaultx_password_${userId}`) ?? userId;
+  
+  const passwordSalt = memorySession.getItem(`vaultx_password_salt_${userId}`);
+  const masterKeyResponse = await deriveMasterKey(password, passwordSalt ?? undefined, CURRENT_ACCOUNT_PBKDF2_ITERATIONS);
+  
+  const masterKey = masterKeyResponse.key;
+  const masterPlain = crypto.getRandomValues(new Uint8Array(32));
+  const searchPlain = crypto.getRandomValues(new Uint8Array(32));
+  const rsaKeys = await generateRSAKeyPair();
+  const privatePlain = b64ToBuf(rsaKeys.privateKey_b64);
+  const masterEncrypted = await aesEncryptArrayBuffer(masterPlain.buffer, masterKey, undefined, bundleAad("master"));
+  const searchEncrypted = await aesEncryptArrayBuffer(searchPlain.buffer, masterKey, undefined, bundleAad("search"));
+  const privateEncrypted = await aesEncryptArrayBuffer(privatePlain, masterKey, undefined, bundleAad("private"));
+  
+  return {
+    password_salt_b64: masterKeyResponse.salt_b64,
+    enc_master_key_b64: masterEncrypted.ciphertext_b64,
+    enc_master_key_iv: masterEncrypted.iv_b64,
+    enc_search_key_b64: searchEncrypted.ciphertext_b64,
+    enc_search_key_iv: searchEncrypted.iv_b64,
+    enc_private_key_b64: privateEncrypted.ciphertext_b64,
+    enc_private_key_iv: privateEncrypted.iv_b64,
+    public_key_b64: rsaKeys.publicKey_b64,
+    kdf_iterations: CURRENT_ACCOUNT_PBKDF2_ITERATIONS,
+    key_bundle_version: 2
+  };
+}
+
+export async function prepareUserKeyBundle(userId: string): Promise<UserKeysResponse> {
+  const keys = await setupUserKeys(userId);
+  return {
+    ...keys,
+    kdf_iterations: keys.kdf_iterations,
+    key_bundle_version: keys.key_bundle_version
+  };
+}
+
+export async function deriveUserKeysFromBundle(
+  keys: UserKeys,
+  password: string
+): Promise<CryptoKey> {
+  const derived = await deriveMasterKey(password, keys.password_salt_b64, keys.kdf_iterations);
+  return derived.key;
+}
+
+export async function getUserKeysFromStorage(userId: string): Promise<UserKeys> {
+  const storedKeys = memorySession.getItem(`vaultx_keys_${userId}`);
+  if (!storedKeys) {
+    throw new Error("User keys not found in storage");
+  }
+  
+  return JSON.parse(storedKeys) as UserKeys;
+}
+
+export async function storeUserKeys(userId: string, keys: UserKeys): Promise<void> {
+  memorySession.setItem(`vaultx_keys_${userId}`, JSON.stringify(keys));
+}
+
+export function clearUserKeys(userId: string): void {
+  memorySession.removeItem(`vaultx_keys_${userId}`);
+  memorySession.removeItem(`vaultx_password_${userId}`);
+  memorySession.removeItem(`vaultx_password_salt_${userId}`);
+}
+
+export async function createUserSession(userId: string): Promise<UserKeys> {
+  // Generate password if not exists
+  if (!memorySession.getItem(`vaultx_password_${userId}`)) {
+    const tempPassword = Array.from({ length: 32 }, () => Math.floor(Math.random() * 36).toString(36)).join('');
+    memorySession.setItem(`vaultx_password_${userId}`, tempPassword);
+  }
+  
+  return await setupUserKeys(userId);
 }

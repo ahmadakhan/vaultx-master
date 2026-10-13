@@ -1,9 +1,7 @@
 "use client"
 
-import { X } from "lucide-react"
 import {
   Dialog,
-  DialogClose,
   DialogContent,
   DialogHeader,
   DialogTitle,
@@ -51,15 +49,6 @@ export function FileDetailModal({ open, onOpenChange, file }: FileDetailModalPro
             </h3>
             <p className="text-sm text-muted-foreground">{meta} file</p>
           </div>
-          <DialogClose asChild>
-            <button
-              type="button"
-              className="rounded-md p-1 text-muted-foreground hover:text-foreground hover:bg-accent/50"
-              aria-label="Close"
-            >
-              <X className="h-4 w-4" strokeWidth={1.5} />
-            </button>
-          </DialogClose>
         </div>
 
         <div className="px-6 pb-6 space-y-5">
