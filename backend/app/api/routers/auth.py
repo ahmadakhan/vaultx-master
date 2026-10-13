@@ -89,6 +89,7 @@ async def _issue_tokens(
     claims: dict[str, Any] = {"sub": str(user.id)}
     if mfa_at is not None:
         claims["mfa_at"] = mfa_at
+        claims["type"] = "access"
     access = create_access_token(claims, jti=jti)
     refresh = create_refresh_token(claims, jti=jti)
     db.add(

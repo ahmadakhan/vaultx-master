@@ -17,6 +17,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import base64
 import secrets
 import time
 from contextlib import asynccontextmanager, suppress
@@ -187,28 +188,40 @@ async def seed_bootstrap_admin(
     if not admin_email or not admin_password:
         return False
 
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     from sqlalchemy import select as _select
+
+    def _b64(value: bytes) -> bytes:
+        return base64.b64encode(value)
+
+    def _bundle_aad(role: str) -> bytes:
+        return f"vaultx:key-bundle:v2:{role}".encode()
+
+    def _derive_password_key(password: str, salt: bytes, *, iterations: int = 600_000) -> bytes:
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=iterations,
+        )
+        return kdf.derive(password.encode("utf-8"))
+
+    def _encrypt_bundle_value(value: bytes, *, role: str, password: str, salt: bytes) -> tuple[bytes, bytes]:
+        iv = secrets.token_bytes(12)
+        key = _derive_password_key(password, salt)
+        ciphertext = AESGCM(key).encrypt(iv, value, _bundle_aad(role))
+        return _b64(ciphertext), _b64(iv)
 
     result = await session.execute(_select(User).where(email_matches(User.email, admin_email)))
     user = result.scalar_one_or_none()
     roles = {"user", "admin"}
     if user is None:
-        def _rand_bytes(length: int) -> bytes:
-            return secrets.token_bytes(length)
-
         user = User(
             email=admin_email,
             password_hash=hash_password(admin_password),
-            password_salt_b64=_rand_bytes(16),
-            enc_master_key_b64=_rand_bytes(48),
-            enc_master_key_iv=_rand_bytes(12),
-            enc_search_key_b64=_rand_bytes(48),
-            enc_search_key_iv=_rand_bytes(12),
-            enc_private_key_b64=_rand_bytes(128),
-            enc_private_key_iv=_rand_bytes(12),
-            public_key_b64=_rand_bytes(256),
-            key_bundle_version=2,
-            password_kdf_iterations=600000,
             is_active=True,
         )
         session.add(user)
@@ -216,12 +229,45 @@ async def seed_bootstrap_admin(
         roles = {"user", "admin"}
     else:
         user.is_active = True
-        if not user.password_hash:
-            user.password_hash = hash_password(admin_password)
-        else:
-            # Allow the bootstrap account to be refreshed if a deployment sets a
-            # new password without disturbing the rest of the record.
-            user.password_hash = hash_password(admin_password)
+        user.password_hash = hash_password(admin_password)
+
+    salt = secrets.token_bytes(16)
+    password_key = _derive_password_key(admin_password, salt)
+    key_pair = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    master_key = secrets.token_bytes(32)
+    search_key = secrets.token_bytes(32)
+    private_key = key_pair.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_key_b64 = _b64(
+        key_pair.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+
+    enc_master_key_b64, enc_master_key_iv = _encrypt_bundle_value(
+        master_key, role="master", password=admin_password, salt=salt
+    )
+    enc_search_key_b64, enc_search_key_iv = _encrypt_bundle_value(
+        search_key, role="search", password=admin_password, salt=salt
+    )
+    enc_private_key_b64, enc_private_key_iv = _encrypt_bundle_value(
+        private_key, role="private", password=admin_password, salt=salt
+    )
+
+    user.password_salt_b64 = _b64(salt)
+    user.enc_master_key_b64 = enc_master_key_b64
+    user.enc_master_key_iv = enc_master_key_iv
+    user.enc_search_key_b64 = enc_search_key_b64
+    user.enc_search_key_iv = enc_search_key_iv
+    user.enc_private_key_b64 = enc_private_key_b64
+    user.enc_private_key_iv = enc_private_key_iv
+    user.public_key_b64 = public_key_b64
+    user.key_bundle_version = 2
+    user.password_kdf_iterations = 600000
 
     for role_name in sorted(roles):
         existing = await session.execute(

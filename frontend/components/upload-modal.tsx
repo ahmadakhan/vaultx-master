@@ -481,8 +481,7 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess, initialFiles 
       tokens_json = JSON.stringify(tokens);
       // One nonce per file, generated once and persisted — every chunk IV is
       // derived from it (see lib/crypto/chunking.ts).
-      // FIX: Generate the file IV once and use it for encryption, not a separate random value
-      const fileIvBytes = genRandomBytes(12);
+      const fileIvBytes = crypto.getRandomValues(new Uint8Array(12));
       fileEncIv = bufToB64(fileIvBytes.buffer as ArrayBuffer);
 
       setUploadFiles((prev) =>
@@ -513,31 +512,30 @@ export function UploadModal({ open, onOpenChange, onUploadSuccess, initialFiles 
     const totalChunks = Math.ceil(totalSize / CHUNK_SIZE) || 1;
     const fileNonce = Uint8Array.from(atob(fileEncIv), (c) => c.charCodeAt(0));
 
-    for (let chunkIndex = item.pausedAtChunk; chunkIndex < totalChunks; chunkIndex++) {
-      if (stopAtBoundary()) return false;
+      for (let chunkIndex = item.pausedAtChunk; chunkIndex < totalChunks; chunkIndex++) {
+        if (stopAtBoundary()) return false;
 
-      const start = chunkIndex * CHUNK_SIZE;
-      const end = Math.min(start + CHUNK_SIZE, totalSize);
-      const chunk = item.file.slice(start, end);
-      const chunkBuffer = await chunk.arrayBuffer();
-      try {
-        const fileKeyBytes = Uint8Array.from(atob(fileKey_b64), (c) => c.charCodeAt(0));
-        let chunkKey: CryptoKey;
+        const start = chunkIndex * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, totalSize);
+        const chunk = item.file.slice(start, end);
+        const chunkBuffer = await chunk.arrayBuffer();
         try {
-          chunkKey = await crypto.subtle.importKey(
-            "raw",
-            fileKeyBytes,
-            { name: "AES-GCM" },
-            false,
-            ["encrypt", "decrypt"]
-          );
-        } finally {
-          fileKeyBytes.fill(0);
-        }
+          const fileKeyBytes = Uint8Array.from(atob(fileKey_b64), (c) => c.charCodeAt(0));
+          let chunkKey: CryptoKey;
+          try {
+            chunkKey = await crypto.subtle.importKey(
+              "raw",
+              fileKeyBytes,
+              { name: "AES-GCM" },
+              false,
+              ["encrypt", "decrypt"]
+            );
+          } finally {
+            fileKeyBytes.fill(0);
+          }
 
-        // Derive this chunk's IV from the persisted file nonce + chunk index.
-        const chunkIv = buildChunkIv(fileNonce, chunkIndex);
-        // FIX: Use the file IV for encryption instead of generating a new random one
+          // Derive this chunk's IV from the persisted file nonce + chunk index.
+          const chunkIv = buildChunkIv(fileNonce, chunkIndex);
         const encryptedChunk = await aesEncryptArrayBuffer(chunkBuffer, chunkKey, chunkIv);
         if (stopAtBoundary()) return false;
         const chunkBytes = Uint8Array.from(atob(encryptedChunk.ciphertext_b64), (c) =>
